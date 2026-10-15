@@ -126,11 +126,12 @@ class _WorkerSpy:
 
     instances: list["_WorkerSpy"] = []
 
-    def __init__(self, text, voice, rate, pitch, out_path, on_done) -> None:
+    def __init__(self, text, attempts, paths, on_done) -> None:
         self.text = text
-        # 记下真实合成会用的音色：预合成与即时合成必须同源（ops-F3）。
-        self.voice = voice
-        self.out_path = out_path
+        # 记下这次合成用的尝试序列与各自缓存路径：预合成与即时合成必须同源（ops-F3）。
+        self.attempts = tuple(attempts)
+        self.paths = tuple(paths)
+        self.out_path = self.paths[0]
         self.on_done = on_done
         _WorkerSpy.instances.append(self)
 
@@ -185,13 +186,21 @@ def _loaded_media_player_class():
 
 
 def _service(tmp_path, monkeypatch, *, tts_available=True):
-    """构造一个不打网络、不碰真实播放器的服务。"""
+    """构造一个不打网络、不碰真实播放器的服务。
+
+    ``tts_available=False`` 表示「一个后端都用不了」——像过去那样只关掉 edge 已经
+    不够了：回退链上还有别的后端，而它们的可用性由各自的 ``availability()`` 判定，
+    所以这里把所有 provider 的可用性一起钉死。
+    """
     import pet.voice_chime_service as svc_mod
 
     _qapp()  # 服务的无主 QTimer 需要在有事件分发器的线程里才起得来（产品同口径）
     _WorkerSpy.instances = []
-    monkeypatch.setattr(svc_mod, "_EDGE_TTS_AVAILABLE", tts_available)
     monkeypatch.setattr(svc_mod, "_TTSWorker", _WorkerSpy)
+    if not tts_available:
+        # 每个 provider 一律自报不可用（不看本机装没装、有没有 Key）
+        for provider in svc_mod.tts.providers():
+            monkeypatch.setattr(type(provider), "availability", lambda self, values: True)
     cfg = Config(base=tmp_path)
     app = _App(cfg)
     service = VoiceChimeService(app)
@@ -1802,8 +1811,9 @@ def test_service_module_top_level_does_not_import_edge_tts():
     proc = _run_python(
         "import importlib.util, sys\n"
         "import pet.voice_chime_service as svc\n"
+        "import pet.tts.edge as edge_mod\n"
         "assert 'edge_tts' not in sys.modules, '模块顶层把 edge_tts import 进来了（白付 1.4s）'\n"
-        "assert svc._EDGE_TTS_AVAILABLE is (importlib.util.find_spec('edge_tts') is not None), "
+        "assert edge_mod._EDGE_TTS_AVAILABLE is (importlib.util.find_spec('edge_tts') is not None), "
         "'惰性探测结果必须与真实可导入性一致（否则会误报“请 pip install”）'\n"
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -1842,12 +1852,16 @@ def test_tts_worker_reports_missing_edge_tts_instead_of_raising(tmp_path, monkey
 
     monkeypatch.setitem(sys.modules, "edge_tts", None)  # import edge_tts → ImportError
     seen: list = []
+    edge_attempt = svc_mod.tts.TtsAttempt(
+        provider="edge",
+        values={"voice": "zh-CN-XiaoxiaoNeural", "rate": 0, "pitch": 0},
+        plan={"provider": "edge", "voice": "zh-CN-XiaoxiaoNeural", "rate": "+0%",
+              "pitch": "+0Hz", "ext": "mp3"},
+    )
     worker = svc_mod._TTSWorker(
         "现在是上午九点整。",
-        "zh-CN-XiaoxiaoNeural",
-        "+0%",
-        "+0Hz",
-        tmp_path / "chime.mp3",
+        (edge_attempt,),
+        (tmp_path / "chime.mp3",),
         lambda path, text, error: seen.append((path, text, error)),
     )
 
@@ -1863,8 +1877,8 @@ def test_service_bubbles_install_hint_when_edge_tts_import_fails(tmp_path, monke
     service, app, _cfg = _service(tmp_path, monkeypatch)
 
     class _MissingWorker:
-        def __init__(self, text, voice, rate, pitch, out_path, on_done) -> None:
-            self._out_path = out_path
+        def __init__(self, text, attempts, paths, on_done) -> None:
+            self._out_path = paths[0]
             self._on_done = on_done
 
         def start(self) -> None:
@@ -2323,11 +2337,13 @@ def test_precache_worker_uses_resolved_voice(tmp_path, monkeypatch):
     这一处曾经传配置原值：音色下架时预合成会拿一把在线表里不存在的嗓子白试两轮
     （产物还落到另一个 key 上），并正好踩进 45s 超时自愈的竞态。
     """
+    import pet.tts.edge as edge_mod
     import pet.voice_chime_service as svc_mod
 
     service, _app, cfg = _service(tmp_path, monkeypatch)
     # 在线表里只剩默认音色 → 配置的这把嗓子被判"已被下架"
-    monkeypatch.setattr(svc_mod, "_live_voices", frozenset({DEFAULT_VOICE}))
+    # （在线表缓存随 edge 后端搬进 provider，此处钉的是 provider 的缓存）
+    monkeypatch.setattr(edge_mod, "_live_voices", frozenset({DEFAULT_VOICE}))
     dead = "zh-CN-XiaohanNeural"
     cfg.set("voice_chime_enabled", True)
     cfg.set("voice_chime_schedule", "hourly")
@@ -2340,13 +2356,11 @@ def test_precache_worker_uses_resolved_voice(tmp_path, monkeypatch):
 
     assert len(_WorkerSpy.instances) == 1
     worker = _WorkerSpy.instances[0]
-    assert worker.voice == DEFAULT_VOICE, "worker 必须拿替换后的音色，不是配置原值"
+    # 尝试序列里带的必须是**替换后**的音色（provider 的 preflight 换的），不是配置原值
+    assert worker.attempts[0].plan["voice"] == DEFAULT_VOICE, \
+        "worker 必须拿替换后的音色，不是配置原值"
     # 与缓存 key 同源：产物文件名就是按替换后音色算出来的那个 key
-    expected = cache_key(worker.text, {
-        "voice": DEFAULT_VOICE,
-        "rate": service._cfg["rate"],
-        "pitch": service._cfg["pitch"],
-    })
+    expected = cache_key(worker.text, service._cfg, provider_id=worker.attempts[0].provider)
     assert worker.out_path.name == f"{expected}.mp3"
 
 
@@ -2867,11 +2881,9 @@ def test_publish_retries_transient_replace_conflicts(tmp_path, monkeypatch):
         return real_replace(src, dst)
 
     monkeypatch.setattr(_os, "replace", flaky_replace)
-    worker = svc_mod._TTSWorker.__new__(svc_mod._TTSWorker)
-    worker._temp_path = temp
-    worker._out_path = target
 
-    assert worker._publish() is True, "瞬时冲突重试之后必须发布成功"
+    # _publish 现在是静态方法（临时名与最终名都由调用方给），不再依赖实例字段
+    assert svc_mod._TTSWorker._publish(temp, target) is True, "瞬时冲突重试之后必须发布成功"
     assert len(attempts) == 3, f"前两次冲突各试一次、第三次成功，实际 {len(attempts)} 次"
     assert target.read_bytes() == b"audio-bytes"
 
@@ -2888,22 +2900,28 @@ def test_publish_gives_up_after_retry_budget_and_keeps_failure_path(tmp_path, mo
 
     results: list[tuple[str, str, str]] = []
     out_path = tmp_path / "chime.mp3"
-    worker = svc_mod._TTSWorker(
-        "现在是上午九点整。换名一直失败", DEFAULT_VOICE, "+0%", "+0Hz",
-        out_path, lambda path, text, error: results.append((path, text, error)),
+    attempt = svc_mod.tts.TtsAttempt(
+        provider="edge",
+        values={"voice": DEFAULT_VOICE, "rate": 0, "pitch": 0},
+        plan={"provider": "edge", "voice": DEFAULT_VOICE, "rate": "+0%",
+              "pitch": "+0Hz", "ext": "mp3"},
     )
-
-    async def fake_synthesize(self, voice: str) -> None:
-        self._temp_path.write_bytes(b"x" * 64)              # 服务端"成功"给了音频
+    worker = svc_mod._TTSWorker(
+        "现在是上午九点整。换名一直失败", (attempt,), (out_path,),
+        lambda path, text, error: results.append((path, text, error)),
+    )
 
     def always_conflict(src, dst):
         raise PermissionError(13, "Permission denied")
 
-    monkeypatch.setattr(svc_mod, "refresh_voice_list", lambda *a, **k: None)
-    monkeypatch.setattr(type(worker), "_synthesize", fake_synthesize)
+    # 让 provider 真实"合成成功"：往 worker 给的临时路径写满字节，随后的换名必然冲突
+    def fake_synth(text, plan, temp_path):
+        Path(temp_path).write_bytes(b"x" * 64)
+
+    monkeypatch.setattr(svc_mod.tts.get("edge"), "synth", fake_synth)
     monkeypatch.setattr(_os, "replace", always_conflict)
 
-    worker._synthesize_to_cache()
+    worker.run()
 
     assert results, "换名一直失败必须走失败回调，不许静默"
     assert "缓存换名失败" in results[-1][2], results[-1][2]
@@ -3209,7 +3227,9 @@ def test_disabled_lazy_created_channel_is_released_on_sync(tmp_path, monkeypatch
     cfg.set("festival_reminder_speak", False)
     cfg.set("self_talk_speak_enabled", False)
     cfg.set("click_show_self_talk", False)
-    monkeypatch.setattr(svc_mod, "_EDGE_TTS_AVAILABLE", False)   # 不打网络
+    # 不打网络：让每个合成后端都自报不可用（可用性判据现由各 provider 提供）
+    for provider in svc_mod.tts.providers():
+        monkeypatch.setattr(type(provider), "availability", lambda self, values: True)
     shell = AppShell(_qapp(), cfg, enable_chat=False)
     assert shell.voice_chime_service is None, "前提：三处开关都关，启动期不建通道"
 
@@ -3296,28 +3316,34 @@ def test_play_file_success_keeps_exempt_respect_quiet(tmp_path, monkeypatch):
 
 def test_resolve_edge_tts_proxy_reads_system_proxy(monkeypatch):
     """#252：系统代理要传给 edge-tts——aiohttp WSS 不读环境变量（trust_env 默认 False），
-    必须显式传 proxy；读不到代理时返回 None（直连）。"""
-    import pet.voice_chime_service as svc_mod  # noqa: F401
+    必须显式传 proxy；读不到代理时返回 None（直连）。
+
+    代理解析随 edge 后端搬进 provider（``pet/tts/edge.py``），语义一字不变。
+    """
+    from pet.tts import edge as edge_provider
 
     monkeypatch.setattr("urllib.request.getproxies",
                         lambda: {"https": "http://127.0.0.1:7890", "http": "http://127.0.0.1:7890"})
-    assert svc_mod._resolve_edge_tts_proxy() == "http://127.0.0.1:7890"
+    assert edge_provider.resolve_proxy() == "http://127.0.0.1:7890"
 
     # 只有 http 键也要认得
     monkeypatch.setattr("urllib.request.getproxies",
                         lambda: {"http": "http://127.0.0.1:1080"})
-    assert svc_mod._resolve_edge_tts_proxy() == "http://127.0.0.1:1080"
+    assert edge_provider.resolve_proxy() == "http://127.0.0.1:1080"
 
     monkeypatch.setattr("urllib.request.getproxies", dict)
-    assert svc_mod._resolve_edge_tts_proxy() is None
+    assert edge_provider.resolve_proxy() is None
 
 
 def test_synthesize_passes_proxy_to_communicate(monkeypatch, tmp_path):
-    """#252：合成路径把系统代理显式传给 edge_tts.Communicate。"""
+    """#252：合成路径把系统代理显式传给 edge_tts.Communicate。
+
+    合成本体现由 edge 后端承担（``EdgeTtsProvider._save``），这条断言跟着搬过去。
+    """
     import asyncio
     import types
 
-    import pet.voice_chime_service as svc_mod
+    from pet.tts import edge as edge_provider
 
     captured: dict = {}
 
@@ -3332,15 +3358,16 @@ def test_synthesize_passes_proxy_to_communicate(monkeypatch, tmp_path):
     monkeypatch.setattr("urllib.request.getproxies",
                         lambda: {"https": "http://127.0.0.1:7890"})
 
-    worker = svc_mod._TTSWorker("文本", "zh-CN-XiaoyiNeural", "+0%", "+0Hz",
-                                tmp_path / "out.mp3", lambda *args: None)
-    asyncio.run(worker._synthesize("zh-CN-XiaoyiNeural"))
+    plan = edge_provider.EdgeTtsProvider().plan({"voice": "zh-CN-XiaoyiNeural", "rate": 0, "pitch": 0})
+    asyncio.run(edge_provider.EdgeTtsProvider._save(
+        sys.modules["edge_tts"], "文本", "zh-CN-XiaoyiNeural", plan, tmp_path / "out.mp3"
+    ))
     assert captured.get("proxy") == "http://127.0.0.1:7890"
 
     # 无系统代理时不传 proxy（直连）
     captured.clear()
     monkeypatch.setattr("urllib.request.getproxies", dict)
-    worker2 = svc_mod._TTSWorker("文本", "zh-CN-XiaoyiNeural", "+0%", "+0Hz",
-                                 tmp_path / "out2.mp3", lambda *args: None)
-    asyncio.run(worker2._synthesize("zh-CN-XiaoyiNeural"))
+    asyncio.run(edge_provider.EdgeTtsProvider._save(
+        sys.modules["edge_tts"], "文本", "zh-CN-XiaoyiNeural", plan, tmp_path / "out2.mp3"
+    ))
     assert captured.get("proxy") is None
