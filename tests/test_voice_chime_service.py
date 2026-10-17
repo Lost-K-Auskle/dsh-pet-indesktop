@@ -1077,10 +1077,16 @@ def test_precache_completion_drains_pending_speech_with_exemption(tmp_path, monk
 
 
 def test_precache_completion_records_path_without_playing(tmp_path, monkeypatch):
-    """预合成本身的语义不变：完成只记录缓存路径，不播放报时音频、不碰待播队列。"""
+    """预合成本身的语义不变：完成只记录缓存路径，不播放报时音频、不碰待播队列。
+
+    ``show_quote=False``：本用例锁的是**整句**预合成路径（单段）。报时句默认带台词
+    时会切段、走分段作业（预热段记在 ``_job.ready``），那条路径的同类语义由
+    ``test_segmented_precache_records_segment_without_playing`` 等分段用例锁住。
+    """
     service, _app, cfg = _service(tmp_path, monkeypatch)
     cfg.set("voice_chime_enabled", True)
     cfg.set("voice_chime_schedule", "hourly")
+    cfg.set("voice_chime_show_quote", False)
     service.apply_config()
 
     service._on_tick(datetime(2026, 9, 15, 9, 59, 30))
@@ -1249,10 +1255,16 @@ def test_channel_guard_keeps_speech_queued_across_completions(tmp_path, monkeypa
     ``_player_engaged`` 由播放器替身的 ``play()`` 驱动（见 ``_self_starting_engagement``）；
     "刚起播"这一状态的判据真值由 ``test_player_engaged_covers_just_started_playback``
     用真实枚举锁住。
+
+    ``show_quote=False``：本用例锁的是**整句**路径的排队语义（预合成在飞 → 到点报时
+    被 busy 门拦下 → 排队）。报时句默认带台词时会切段走分段作业，到点那一刻是
+    **认领预热作业**（不排队，见 ``_fire`` 的分段路由），那条路径的不变量由
+    ``test_segmented_claim_keeps_pending_speech_queued_until_end`` 锁住。
     """
     service, _app, cfg = _service(tmp_path, monkeypatch)
     cfg.set("voice_chime_enabled", True)
     cfg.set("voice_chime_schedule", "hourly")
+    cfg.set("voice_chime_show_quote", False)
     service.apply_config()
     exempt = "今天也要认真工作呀。"
     cached_exempt = _cache_mp3(service, exempt)
@@ -1526,10 +1538,16 @@ def test_chime_outlet_requeues_with_the_original_tuple(tmp_path, monkeypatch):
     报时被占用判据留队后又碰上"播放时刻通道被接管"，回队时要原样带回
     （口播文本 / 时间戳 / 气泡文本 / 气泡开关 / role / 免打扰口径），否则补播时
     会丢掉气泡或换成另一段内容。
+
+    ``show_quote=False``：回队（存整句 tuple）是**整句**路径的行为。分段作业遇到
+    "合成完成时通道被接管"不是回队而是**就地等待**（下一次"通道空出"的拍子再起播，
+    见 ``_pump_job`` 的 ``allow_engaged``），语义由
+    ``test_segmented_waits_for_channel_instead_of_cutting_ongoing_audio`` 锁住。
     """
     service, _app, cfg = _service(tmp_path, monkeypatch)
     cfg.set("voice_chime_enabled", True)
     cfg.set("voice_chime_schedule", "hourly")
+    cfg.set("voice_chime_show_quote", False)
     service.apply_config()
     engaged = {"now": False}
     monkeypatch.setattr(service, "_player_engaged", lambda: engaged["now"])
@@ -3371,3 +3389,489 @@ def test_synthesize_passes_proxy_to_communicate(monkeypatch, tmp_path):
         sys.modules["edge_tts"], "文本", "zh-CN-XiaoyiNeural", plan, tmp_path / "out2.mp3"
     ))
     assert captured.get("proxy") is None
+
+
+# ============================================ 分段播报：按标点切段、逐段合成、顺序播放
+#
+# 动机（用户指令，2026-10-17）：长句整段合成时，从起合成到"听到开头"要等整段
+# 合成完（数秒）。按标点切成片段后：**首段合成完就出声**，后续段在播放期间预取，
+# 体感等待从"整段合成"降到"首段合成"。
+#
+# 设计不变量（实现见 pet/voice_chime_service.py 的 _SpeechJob / _pump_job）：
+#   1) 单段文本（n==1）逐字走改动前的整句路径——老行为、老缓存键一个字节不变；
+#   2) 作业活跃期间**恰好一个**段合成在飞（串行预取，不并发铺满）；
+#   3) 播放严格按段序；合成失败 / 超时只跳过该段；一个字都没出过声才冒失败气泡；
+#   4) 气泡随首个出声段展示一次；
+#   5) 合成**完成**时通道被别的音频占用 → 就地等待，不顶播（同整句路径的回队
+#      口径）；点火 / 认领那一刻已就绪的首段则与"整句缓存命中"同口径：立即出声。
+
+SEG_TEXT = "现在是上午九点整。今天也要认真工作呀。"
+SEG_TEXT_B = "现在是上午七点整。早睡早起身体好。"
+
+
+def test_segmented_plays_first_segment_while_the_rest_synthesizes(tmp_path, monkeypatch):
+    """核心收益：首段合成完立即出声，后续段在播放期间预取，随后顺序接上。
+
+    锁三件事：① 起步只合成第一段（不是整句）；② 首段就绪即起播，同时第二段
+    进合成线程（先预取、后起播）；③ 顺序播放——第二段不得顶掉在播的第一段，
+    要等它的 EndOfMedia。
+    """
+    service, app, _cfg = _service(tmp_path, monkeypatch)
+    service.apply_config()
+
+    service.say_now(SEG_TEXT)
+
+    assert len(_WorkerSpy.instances) == 1, "起步只起一段合成（单飞不变量）"
+    assert _WorkerSpy.instances[0].text == "现在是上午九点整。", "先合成第一段"
+    assert service._player.plays == 0, "首段还没回来，暂不出声"
+
+    _WorkerSpy.instances[0].finish()
+    _qapp().processEvents()
+
+    assert service._player.plays == 1, "首段合成完即出声（不等整条）"
+    assert len(_WorkerSpy.instances) == 2, "起播的同时预取第二段"
+    assert _WorkerSpy.instances[1].text == "今天也要认真工作呀。"
+    assert [m for m, _ms in app.win.bubbles].count(SEG_TEXT) == 1, "气泡随首段展示一次"
+
+    _WorkerSpy.instances[1].finish()
+    _qapp().processEvents()
+    assert service._player.plays == 1, "第一段在播（等 EndOfMedia），第二段不得顶播"
+
+    service._terminal_statuses = ("END",)
+    service._on_media_status("END")
+    assert service._player.plays == 2, "首段播完 → 顺序接上第二段"
+    assert [Path(s).name for s in service._player.sources][-1] == \
+        Path(_WorkerSpy.instances[1].out_path).name
+    assert [m for m, _ms in app.win.bubbles].count(SEG_TEXT) == 1, \
+        "后续段只出声：气泡不得重复展示"
+
+    service._on_media_status("END")
+    assert service._job is None, "全部播完 → 作业收口放掉槽位"
+
+
+def test_short_text_stays_on_the_whole_sentence_path(tmp_path, monkeypatch):
+    """n==1 冻结：短句不切段、不建作业，合成输入与缓存键都是整句（老行为不变）。"""
+    service, _app, _cfg = _service(tmp_path, monkeypatch)
+    service.apply_config()
+    text = "现在是上午九点整。"
+
+    service.say_now(text)
+
+    assert service._job is None, "单段文本不建分段作业"
+    assert len(_WorkerSpy.instances) == 1
+    assert _WorkerSpy.instances[0].text == text, "整句合成（缓存键也是整句）"
+
+
+def test_whole_sentence_cache_hit_wins_over_segmentation(tmp_path, monkeypatch):
+    """整句缓存命中优先于分段：已备好的单文件直接播，零网络、不建作业。
+
+    老版本留下的整句缓存（升级前预合成的）不该被分段逻辑废弃：文件已在盘上，
+    播它就是最优解。
+    """
+    service, app, cfg = _service(tmp_path, monkeypatch)
+    service.apply_config()
+    cached = _cache_file_for(service, cfg, SEG_TEXT)
+
+    service.say_now(SEG_TEXT)
+
+    assert service._job is None and _WorkerSpy.instances == []
+    assert service._player.plays == 1
+    assert [Path(s).name for s in service._player.sources] == [cached.name]
+    assert any(m == SEG_TEXT for m, _ms in app.win.bubbles)
+
+
+def test_segmented_precache_records_segment_without_playing(tmp_path, monkeypatch):
+    """分段预合成：段就绪记在作业里（不是 ``_precache_path``），全程不出声。
+
+    整句预合成的同类语义由 ``test_precache_completion_records_path_without_playing``
+    锁住（show_quote=False 的单段句）；本条是默认配置（带台词 → 2 段）下的对应
+    契约：按段序**顺序**预热（前一段就绪才起下一段），预热产物留在作业的
+    ``ready`` 里等报时点认领。
+    """
+    service, _app, cfg = _service(tmp_path, monkeypatch)
+    cfg.set("voice_chime_enabled", True)
+    cfg.set("voice_chime_schedule", "hourly")
+    service.apply_config()
+
+    service._on_tick(datetime(2026, 9, 15, 9, 59, 30))       # 距 10:00 只 30s → 预热
+
+    job = service._job
+    assert job is not None and job.attached is False, "预热作业（未认领）"
+    assert len(_WorkerSpy.instances) == 1, "顺序预热：一次只热一段"
+    assert _WorkerSpy.instances[0].text == "现在是上午十点整。"
+    assert service._player.plays == 0, "预热不得出声"
+
+    _WorkerSpy.instances[0].finish()
+    _qapp().processEvents()
+
+    assert 0 in job.ready, "首段就绪记在作业里（不是 _precache_path）"
+    assert service._precache_path is None, "分段预合成没有整句文件"
+    assert len(_WorkerSpy.instances) == 2, "前一段就绪才起下一段"
+    assert _WorkerSpy.instances[1].text == "当时只道是寻常。"
+    assert service._player.plays == 0
+
+    _WorkerSpy.instances[1].finish()
+    _qapp().processEvents()
+
+    assert set(job.ready) == {0, 1}, "两段都就绪"
+    assert service._job is job, "预热完成仍留场（等到点认领）"
+    assert service._player.plays == 0, "预热全程不出声（到点由 _fire 播缓存）"
+
+
+def test_segmented_precache_claim_plays_from_cache_at_slot_time(tmp_path, monkeypatch):
+    """到点认领预热作业：首段缓存已就绪 → 立刻出声，末段随 EndOfMedia 顺序接上。"""
+    service, _app, cfg = _service(tmp_path, monkeypatch)
+    cfg.set("voice_chime_enabled", True)
+    cfg.set("voice_chime_schedule", "hourly")
+    service.apply_config()
+
+    service._on_tick(datetime(2026, 9, 15, 9, 59, 30))
+    job = service._job
+    _WorkerSpy.instances[0].finish()
+    _qapp().processEvents()
+    _WorkerSpy.instances[1].finish()
+    _qapp().processEvents()
+    assert set(job.ready) == {0, 1}
+
+    service._on_tick(datetime(2026, 9, 15, 10, 0, 0))        # 报时到点
+
+    assert service._precache_slot is None, "到点消费掉占位"
+    assert service._job is job and job.attached is True, "认领同一作业"
+    assert service._player.plays == 1, "首段缓存就绪 → 到点立刻出声"
+    assert [Path(s).name for s in service._player.sources] == [Path(job.ready[0]).name]
+
+    service._terminal_statuses = ("END",)
+    service._on_media_status("END")
+    assert service._player.plays == 2, "第二段顺序接上"
+
+    service._on_media_status("END")
+    assert service._job is None, "播完收口"
+
+
+def test_segmented_claim_reuses_the_inflight_first_segment(tmp_path, monkeypatch):
+    """预合成没赶上整组热完：到点认领**不重发请求**，首段一就绪立即出声。
+
+    认领路由刻意放在 busy 门之前：若要等整组热完才出声，首声延迟反而比整句
+    合成更差（整句路径此刻会排队到预热完成）。
+    """
+    service, _app, cfg = _service(tmp_path, monkeypatch)
+    cfg.set("voice_chime_enabled", True)
+    cfg.set("voice_chime_schedule", "hourly")
+    service.apply_config()
+
+    service._on_tick(datetime(2026, 9, 15, 9, 59, 30))
+    assert len(_WorkerSpy.instances) == 1, "前提：首段合成在飞"
+
+    service._on_tick(datetime(2026, 9, 15, 10, 0, 0))        # 到点：首段还没回来
+
+    assert service._queued_fire is None, "认领发生在 busy 门之前，不入队"
+    assert service._job is not None and service._job.attached is True
+    assert len(_WorkerSpy.instances) == 1, "不重发首段请求（在飞的那枚接着用）"
+    assert service._player.plays == 0
+
+    _WorkerSpy.instances[0].finish()
+    _qapp().processEvents()
+
+    assert service._player.plays == 1, "首段一就绪立刻出声"
+    assert len(_WorkerSpy.instances) == 2, "同时预取第二段"
+
+
+def test_segmented_claim_keeps_pending_speech_queued_until_end(tmp_path, monkeypatch):
+    """分段作业在播期间豁免语音留队：END 之后（作业播完）才出队出声。
+
+    整句路径的 P2-1 同类语义由 ``test_channel_guard_keeps_speech_queued_across_completions``
+    锁住（show_quote=False 的排队路径）；本条锁的是**认领段**变体：到点认领
+    预热作业、首段一起播就预取第二段，这中间豁免语音必须原样留队，通道真空闲
+    的那一拍（第二段 END 之后）才出队。
+    """
+    service, _app, cfg = _service(tmp_path, monkeypatch)
+    cfg.set("voice_chime_enabled", True)
+    cfg.set("voice_chime_schedule", "hourly")
+    service.apply_config()
+    exempt = "今天也要认真工作呀。"
+    cached_exempt = _cache_mp3(service, exempt)
+    engaged = _self_starting_engagement(service, monkeypatch)
+
+    service._on_tick(datetime(2026, 9, 15, 9, 59, 30))
+    assert len(_WorkerSpy.instances) == 1, "前提：首段合成在飞"
+    assert service.speak(exempt, log_tag="点击自言自语", respect_quiet=False) is True
+    assert service._pending_speech == exempt, "合成在飞 → 豁免语音入队"
+
+    service._on_tick(datetime(2026, 9, 15, 10, 0, 0))        # 认领预热作业
+    assert service._queued_fire is None
+
+    _WorkerSpy.instances[0].finish()                          # 首段就绪 → 起播 + 预取
+    _qapp().processEvents()
+    assert service._player.plays == 1
+    assert service._pending_speech == exempt, "刚起播 → 豁免语音留队，不得顶播"
+    assert len(_WorkerSpy.instances) == 2, "起播的同时预取第二段"
+
+    _WorkerSpy.instances[1].finish()                          # 第二段备好（在播中）
+    _qapp().processEvents()
+    assert service._player.plays == 1, "第一段在播：第二段就绪也不得顶播"
+
+    engaged["engaged"] = False
+    service._terminal_statuses = ("END",)
+    service._on_media_status("END")                           # 首段播完 → 接第二段
+    assert service._player.plays == 2
+    assert service._pending_speech == exempt, "作业还有段在播 → 仍留队"
+
+    engaged["engaged"] = False                                # 第二段也播完了
+    service._on_media_status("END")                           # 作业播完 → 通道空出
+    assert service._job is None
+    assert service._pending_speech is None
+    assert service._player.plays == 3, "通道真空闲后豁免语音才出队出声"
+    assert [Path(s).name for s in service._player.sources][-1] == cached_exempt.name
+
+
+def test_segmented_waits_for_channel_instead_of_cutting_ongoing_audio(
+        tmp_path, monkeypatch):
+    """合成**完成**时通道被别的音频占用 → 就地等待，不顶播（同整句路径的回队口径）。
+
+    整句路径的"回队不顶播"由 ``test_chime_outlet_requeues_with_the_original_tuple``
+    锁住；分段作业不在 ``_queued_fire`` 里绕一圈，而是**就地等**：通道空出的那一
+    拍（END）由 ``_on_media_status`` 的 pump 补播。判据由 ``play()`` 驱动的替身
+    给出（见 ``_self_starting_engagement``），与真实"刚起播"窗口同口径。
+    """
+    service, _app, _cfg = _service(tmp_path, monkeypatch)
+    service.apply_config()
+    engaged = _self_starting_engagement(service, monkeypatch)
+
+    service.say_now(SEG_TEXT)
+    assert len(_WorkerSpy.instances) == 1
+
+    engaged["engaged"] = True                                 # 别的音频正在播
+    _WorkerSpy.instances[0].finish()
+    _qapp().processEvents()
+
+    assert service._player.plays == 0, "合成完成不得顶掉正在播的别的音频"
+    assert service._job is not None, "作业就地等待（不丢）"
+
+    engaged["engaged"] = False                                # 别的音频播完
+    service._terminal_statuses = ("END",)
+    service._on_media_status("END")
+
+    assert service._player.plays == 1, "通道空出后补播首段"
+
+
+def test_segmented_ignition_with_ready_first_segment_still_plays_immediately(
+        tmp_path, monkeypatch):
+    """点火那一刻首段已缓存（= 整句缓存命中的分段等价物）：立即出声，允许顶播。
+
+    与整句缓存例外同口径：报时点到、首段备好，就该立刻响；正在播的别的音频由
+    本次 setSource 接替。
+    """
+    service, app, _cfg = _service(tmp_path, monkeypatch)
+    service.apply_config()
+    engaged = _self_starting_engagement(service, monkeypatch)
+    _cache_mp3(service, "现在是上午九点整。")
+    _cache_mp3(service, "今天也要认真工作呀。")
+
+    engaged["engaged"] = True                                 # 别的音频正在播
+    service.say_now(SEG_TEXT)
+
+    assert service._player.plays == 1, "首段已就绪 → 点火即出声（缓存例外同口径）"
+    assert _WorkerSpy.instances == [], "两段都命中缓存：一个请求都不发"
+    assert [m for m, _ms in app.win.bubbles].count(SEG_TEXT) == 1
+
+
+def test_segmented_failed_segment_is_skipped_and_the_rest_plays(tmp_path, monkeypatch):
+    """一段合成失败只跳过该段，其余段照播；有出声就不冒失败气泡。"""
+    service, app, _cfg = _service(tmp_path, monkeypatch)
+    service.apply_config()
+
+    service.say_now(SEG_TEXT)
+    _WorkerSpy.instances[0].finish(error="first segment boom")
+    _qapp().processEvents()
+
+    assert service._player.plays == 0
+    assert len(_WorkerSpy.instances) == 2, "失败段跳过，继续合成下一段"
+    assert _WorkerSpy.instances[1].text == "今天也要认真工作呀。"
+
+    _WorkerSpy.instances[1].finish()
+    _qapp().processEvents()
+
+    assert service._player.plays == 1, "能播的照播（不让一段失败葬送整条）"
+    assert not any("合成失败" in m for m, _ms in app.win.bubbles), "有出声就不冒失败气泡"
+
+
+def test_segmented_all_segments_failed_shows_one_failure_bubble(tmp_path, monkeypatch):
+    """整条一个字都没出过声：收口时按失败口径冒**一次**气泡，作业放掉。"""
+    service, app, _cfg = _service(tmp_path, monkeypatch)
+    service.apply_config()
+
+    service.say_now(SEG_TEXT)
+    _WorkerSpy.instances[0].finish(error="boom one")
+    _qapp().processEvents()
+    _WorkerSpy.instances[1].finish(error="boom two")
+    _qapp().processEvents()
+
+    assert service._player.plays == 0
+    assert service._job is None, "整条收口"
+    bubbles = [m for m, _ms in app.win.bubbles if "合成失败" in m]
+    assert len(bubbles) == 1, "失败气泡只冒一次"
+    assert "boom" in bubbles[0], "带上首段失败原因"
+
+
+def test_segmented_synthesis_timeout_skips_that_segment(tmp_path, monkeypatch):
+    """看门狗超时按段记账：超时的段跳过，其余段照播（不让一个段挂死整条）。"""
+    import time as _time
+
+    import pet.voice_chime_service as svc_mod
+
+    service, _app, _cfg = _service(tmp_path, monkeypatch)
+    service.apply_config()
+
+    service.say_now(SEG_TEXT)
+    assert len(_WorkerSpy.instances) == 1
+
+    service._busy_since = _time.monotonic() - (svc_mod._SYNTH_TIMEOUT_S + 1.0)
+    service._release_stale_busy()                             # 等价于"看门狗到点"
+
+    assert service._job is not None and 0 in service._job.failed, "超时段按失败记账"
+    assert len(_WorkerSpy.instances) == 2, "超时段跳过，泵继续下一段"
+    assert _WorkerSpy.instances[1].text == "今天也要认真工作呀。"
+
+    _WorkerSpy.instances[1].finish()
+    _qapp().processEvents()
+    assert service._player.plays == 1, "能播的照播"
+
+
+def test_segmented_quiet_edge_stops_the_playing_segment_and_drops_the_rest(
+        tmp_path, monkeypatch):
+    """免打扰在播出期间生效：立刻停声、整组作废，剩余段不再出声。"""
+    service, _app, _cfg = _service(tmp_path, monkeypatch)
+    service.apply_config()
+
+    service.say_now(SEG_TEXT)
+    _WorkerSpy.instances[0].finish()                          # 首段起播 + 预取第二段
+    _qapp().processEvents()
+    assert service._player.plays == 1
+
+    _quiet().start(15)                                        # 用户开了免打扰
+
+    assert service._player.stops == 1, "免打扰生效即停声"
+    assert service._job is None, "整组作废"
+
+    _WorkerSpy.instances[1].finish()                          # 迟到的第二段结果
+    _qapp().processEvents()
+    assert service._player.plays == 1, "作废后迟到的段不得出声"
+
+
+def test_segmented_quiet_before_first_segment_drops_the_whole_job(tmp_path, monkeypatch):
+    """免打扰在首段合成期间生效：结果不出声、后续段连合成都不再起（省请求）。"""
+    service, _app, _cfg = _service(tmp_path, monkeypatch)
+    service.apply_config()
+
+    service.say_now(SEG_TEXT)
+    _quiet().start(15)                                        # 合成期间进入免打扰
+    _WorkerSpy.instances[0].finish()
+    _qapp().processEvents()
+
+    assert service._player.plays == 0, "免打扰期间丢弃"
+    assert service._job is None, "整组作废"
+    assert len(_WorkerSpy.instances) == 1, "后续段不再起合成"
+    assert _quiet().pending_count() == 1, "气泡照旧进暂存队列（语义不变）"
+
+
+def test_segmented_new_fire_preempts_the_old_job(tmp_path, monkeypatch):
+    """新的报时点火抢占旧作业：旧作业作废（含已就绪未播的段），新作业从头合成。
+
+    旧段**音频照常响到自然结束**（新点火不在完成时顶播，同回队口径）：END 那一
+    拍新作业的首段才接上；旧作业已就绪但没轮到的段永远不再出声。
+    """
+    service, _app, _cfg = _service(tmp_path, monkeypatch)
+    service.apply_config()
+
+    service.say_now(SEG_TEXT)
+    _WorkerSpy.instances[0].finish()                          # A 首段起播 + 预取 A2
+    _qapp().processEvents()
+    assert service._player.plays == 1
+    old_job = service._job
+    assert old_job is not None
+
+    _WorkerSpy.instances[1].finish()                          # A2 备好（A 在播中）
+    _qapp().processEvents()
+    assert service._job is old_job and service._player.plays == 1
+
+    service.say_now(SEG_TEXT_B)                               # 通道无合成在飞 → 抢占
+    assert service._job is not old_job, "换成了新作业"
+    assert len(_WorkerSpy.instances) == 3, "新作业从头起合成"
+    assert _WorkerSpy.instances[2].text == "现在是上午七点整。"
+
+    _WorkerSpy.instances[2].finish()                          # 新首段备好
+    _qapp().processEvents()
+    assert service._player.plays == 1, "旧段还在播：新首段就地等待，不顶播"
+
+    service._terminal_statuses = ("END",)
+    service._on_media_status("END")                           # 旧段播完 → 新首段接上
+    assert service._player.plays == 2
+    assert [Path(s).name for s in service._player.sources][-1] == \
+        Path(_WorkerSpy.instances[2].out_path).name
+    assert Path(_WorkerSpy.instances[1].out_path).name not in \
+        [Path(s).name for s in service._player.sources], "旧作业未播的段不得再出声"
+
+
+def test_segmented_fire_while_synthesizing_is_queued_as_the_whole_sentence(
+        tmp_path, monkeypatch):
+    """另有合成在飞（比如别处的整句合成）→ 分段报时整体排队；出队后重新切段建作业。"""
+    import time as _time
+
+    service, _app, cfg = _service(tmp_path, monkeypatch)
+    cfg.set("voice_chime_enabled", True)
+    cfg.set("voice_chime_schedule", "hourly")
+    service.apply_config()
+
+    service._busy = True                                      # 别的合成在飞
+    service._busy_since = _time.monotonic()
+    service._on_tick(datetime(2026, 9, 15, 10, 0, 0))
+
+    assert service._job is None, "合成在飞时不建作业"
+    queued = service._queued_fire
+    assert queued is not None and queued[0] == "现在是上午十点整。当时只道是寻常。", \
+        "排队存整句（出队重切）"
+
+    service._busy = False                                     # 通道空出 → 出队
+    service._terminal_statuses = ("END",)
+    service._on_media_status("END")
+
+    assert service._queued_fire is None
+    assert service._job is not None, "出队后建起分段作业"
+    assert _WorkerSpy.instances[0].text == "现在是上午十点整。", "从首段起合成"
+
+
+def test_segmented_stop_kills_the_job_and_late_results_are_dropped(tmp_path, monkeypatch):
+    """stop()（关闭开关 / 退出）整组作废：在飞段作废、迟到结果不出声。"""
+    service, _app, _cfg = _service(tmp_path, monkeypatch)
+    service.apply_config()
+
+    service.say_now(SEG_TEXT)
+    assert service._job is not None
+
+    service.stop()
+
+    assert service._job is None, "stop() 必须清掉作业（含只等通道 / 预热中的）"
+    _WorkerSpy.instances[0].finish()
+    _qapp().processEvents()
+    assert service._player.plays == 0, "作废后迟到的合成结果不得出声"
+
+
+def test_segmented_apply_config_drops_precache_but_keeps_attached(tmp_path, monkeypatch):
+    """配置变更：预热作业作废重热；**已认领**的作业不碰（用户正在听它）。"""
+    service, _app, cfg = _service(tmp_path, monkeypatch)
+    cfg.set("voice_chime_enabled", True)
+    cfg.set("voice_chime_schedule", "hourly")
+    service.apply_config()
+
+    service._on_tick(datetime(2026, 9, 15, 9, 59, 30))        # 预热作业在热
+    assert service._job is not None and not service._job.attached
+
+    service.apply_config()                                    # 设置保存 → 预热作废
+    assert service._job is None
+
+    service.say_now(SEG_TEXT)                                 # 人工报时 → 已认领作业
+    attached = service._job
+    assert attached is not None and attached.attached
+
+    service.apply_config()
+    assert service._job is attached, "已认领的作业不因配置变更被拦腰截断"

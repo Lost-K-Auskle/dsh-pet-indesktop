@@ -32,8 +32,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field as dataclass_field
 
 #: 字段类型 → 设置页控件（见 voice_chime_settings._build_field_widget）
-#: - select 下拉 / text 单行 / multiline 多行 / number 数字 / flag 开关 / secret 密钥
-FIELD_KINDS = ("select", "text", "multiline", "number", "flag", "secret")
+#: - select 下拉 / text 单行 / multiline 多行 / number 数字 / flag 开关 /
+#:   secret 密钥 / path 本地文件（输入框 + 浏览按钮，值为文件路径）
+FIELD_KINDS = ("select", "text", "multiline", "number", "flag", "secret", "path")
 
 
 @dataclass(frozen=True)
@@ -60,9 +61,20 @@ class TtsField:
     min_height: int = 80
     secret_ref: str = ""
     advanced: bool = False
-    #: 当另一个字段取到指定值时本行隐藏：``(字段 name, 值)``。
-    #: 例：MiMo 选「音色设计」模型时内置音色行没有意义。
-    hidden_when: tuple[str, object] | None = None
+    #: 当另一个字段取到指定值时本行隐藏：``(字段 name, 值)``，或多个条件写成
+    #: ``((name, 值), (name, 值), ...)``（任一命中即隐）。
+    #: 例：MiMo 选「音色设计」/「克隆音色」模型时内置音色行都没有意义。
+    hidden_when: tuple | None = None
+    #: 反过来的依赖：只有另一个字段取到指定值时本行才显示：``(字段 name, 值)``。
+    #: 例：MiMo 选「克隆音色」模型时才出现参考音频行。
+    #: 显隐判断统一走 :func:`field_visible`，设置页不各自解释。
+    visible_when: tuple[str, object] | None = None
+    #: 本地文件字段（``kind="path"``）专用：文件内容影响合成结果，服务层会把
+    #: 文件指纹并进缓存键（换文件即换缓存）。非文件字段该值无意义。
+    affects_cache: bool = False
+    #: 本地文件字段（``kind="path"``）专用：文件选择对话框的过滤器（Qt 语法，
+    #: 如 ``音频文件 (*.mp3 *.wav)``）；空 = 不加过滤（所有文件）。
+    file_filter: str = ""
     #: 下拉里没有当前配置值时，是否补一个「自定义：<值>」项（兼容手改配置文件）。
     allow_custom: bool = True
 
@@ -208,6 +220,31 @@ def fallback_ids(exclude: str = "") -> tuple[str, ...]:
 
 def secret_fields(provider: TtsProvider) -> tuple[TtsField, ...]:
     return tuple(spec for spec in provider.fields if spec.kind == "secret")
+
+
+def field_visible(spec: TtsField, values: dict) -> bool:
+    """字段行在当前字段值下该不该显示（``hidden_when`` / ``visible_when`` 的统一解释）。
+
+    ``values`` 是「字段短名 → 已清洗的当前值」（设置页读控件、服务层读配置都用
+    这张表）。隐藏优先：任一 ``hidden_when`` 条件命中即隐；``visible_when`` 是
+    白名单语义——给了它，值不等于声明值就是隐。两者都没声明 → 恒显。
+    """
+    for name, value in _dep_pairs(spec.hidden_when):
+        if values.get(name) == value:
+            return False
+    for name, value in _dep_pairs(spec.visible_when):
+        if values.get(name) != value:
+            return False
+    return True
+
+
+def _dep_pairs(when) -> tuple[tuple[str, object], ...]:
+    """依赖声明的两种写法归一：``(名字, 值)`` 单条 / ``((名字, 值), ...)`` 多条。"""
+    if not when:
+        return ()
+    if isinstance(when[0], str):
+        return (tuple(when),)  # type: ignore[return-value]
+    return tuple((pair[0], pair[1]) for pair in when)
 
 
 def _clean_flag(value, default: bool) -> bool:

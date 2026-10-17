@@ -291,6 +291,7 @@ def test_voice_and_festival_domains_split_into_groups(tmp_path, monkeypatch):
         for key in ("voice_chime_tts_backend", "voice_chime_tts_fallback",
                     "voice_chime_doubao_speaker", "voice_chime_doubao_pitch",
                     "voice_chime_mimo_model", "voice_chime_mimo_voice", "voice_chime_mimo_style",
+                    "voice_chime_mimo_ref_audio",
                     "voice_chime_sapi_voice", "voice_chime_sapi_rate"):
             assert key in voice_rows, f"「语音报时」缺后端字段行：{key}"
         # 节日提醒按卡归属

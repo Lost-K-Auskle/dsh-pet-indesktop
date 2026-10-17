@@ -85,16 +85,21 @@ MIMO_BASE_URL = _mimo_provider.MIMO_BASE_URL
 MIMO_CHAT_PATH = _mimo_provider.MIMO_CHAT_PATH
 MIMO_MODEL = _mimo_provider.MIMO_MODEL
 MIMO_MODEL_VOICE_DESIGN = _mimo_provider.MIMO_MODEL_VOICE_DESIGN
+MIMO_MODEL_VOICE_CLONE = _mimo_provider.MIMO_MODEL_VOICE_CLONE
 MIMO_MODELS = _mimo_provider.MIMO_MODELS
 MIMO_VOICE_OPTIONS = _mimo_provider.MIMO_VOICE_OPTIONS
 MIMO_STYLE_MAX_LEN = _mimo_provider.MIMO_STYLE_MAX_LEN
 MIMO_AUDIO_FORMAT = _mimo_provider.MIMO_AUDIO_FORMAT
 MIMO_TIMEOUT_S = _mimo_provider.MIMO_TIMEOUT_S
+MIMO_REF_AUDIO_MAX_BYTES = _mimo_provider.MIMO_REF_AUDIO_MAX_BYTES
 clean_mimo_model = _mimo_provider.clean_mimo_model
 clean_mimo_voice = _mimo_provider.clean_mimo_voice
 clean_mimo_style = _mimo_provider.clean_mimo_style
+clean_mimo_ref_audio = _mimo_provider.clean_mimo_ref_audio
 mimo_messages = _mimo_provider.mimo_messages
 mimo_payload = _mimo_provider.mimo_payload
+mimo_ref_audio_problem = _mimo_provider.mimo_ref_audio_problem
+mimo_ref_audio_uri = _mimo_provider.mimo_ref_audio_uri
 parse_mimo_audio = _mimo_provider.parse_mimo_audio
 
 # edge-tts 中英文音色下拉列表（value=音色名，label=友好中文标签）。
@@ -579,6 +584,73 @@ def build_bubble_sentence(now: datetime, cfg: dict) -> str:
     return f"{text}。{quote}" if quote else text
 
 
+# ---------------------------------------------------------------- 口播分段
+# 「长文本整段合成」的首声等待 = 整段合成耗时；按标点切成片段后，第一段合成完
+# 就能出声、后续段在播放期间预合成（服务层按段建作业、逐段顺序播放）。
+# 纯函数：零 IO、零 Qt，可在无 GUI 环境直接测。
+SEGMENT_SPLIT_MIN_TEXT = 16   # 全文短于此不切：短句切了只有额外调用，没有体感收益
+SEGMENT_MIN_CHARS = 6         # 片段短于此就向后并入（「呀！」这类碎段不值得单独合成）
+SEGMENT_WEAK_MIN = 12         # 弱标点只在当前累计长度达此值时才断（避免逗号碎切）
+MAX_SPEECH_SEGMENTS = 12      # 段数上限（纯防御：超长输入也只是多几次调用，不无界）
+#: 强断点：句末性质，见到就切（换行等同）。ASCII 句点 '.' 刻意不在内——小数、
+#: 版本号、英文缩写都会误伤，收益不值。
+_SEGMENT_STRONG = "。！？；…!?;\n"
+#: 弱断点：从句停顿，仅在当前累计够长（``SEGMENT_WEAK_MIN``）时切。
+_SEGMENT_WEAK = "，、,：:"
+#: 断点后紧跟的收尾符号并入本段（"他说：“你好。”" 的右引号不能掉到下一段开头）。
+_SEGMENT_CLOSERS = "”’』」）】》〉"
+
+
+def split_speech_segments(text) -> tuple[str, ...]:
+    """把一段口播文本按标点切成**顺序片段**（分段合成、逐段播放的输入）。
+
+    规则（常量见上）：
+    - 全文短于 ``SEGMENT_SPLIT_MIN_TEXT`` → 原样单段返回（空文本返回空元组）；
+    - 强标点总是切、弱标点仅在当前累计 ``>= SEGMENT_WEAK_MIN`` 时切；
+    - 切出的片段短于 ``SEGMENT_MIN_CHARS`` 时不单独成段，向后并入；
+    - 段数超过 ``MAX_SPEECH_SEGMENTS`` 时反复合并**最短的相邻对**（防御性上限）；
+    - 单段结果**原样返回整段原文**——不分段路径上的缓存键与改动前逐字节一致。
+
+    纯度：纯字符串运算，不读配置、不碰 IO。分段只改「怎么合成、怎么播」，
+    不改变每段自身的缓存键定义：每段各自按既有 ``cache_key(段文本, cfg)``
+    取键，因此上线后旧缓存里「整句」的键不再被查（等价于整句重新合成一次，
+    逐段落盘后重复段落的命中率反而更高）。
+    """
+    source = str(text or "").strip()
+    if len(source) < SEGMENT_SPLIT_MIN_TEXT:
+        return (source,) if source else ()
+    pieces: list[str] = []
+    buf = ""
+    index = 0
+    total = len(source)
+    while index < total:
+        buf += source[index]
+        char = source[index]
+        weak_cut = char in _SEGMENT_WEAK and len(buf.strip()) >= SEGMENT_WEAK_MIN
+        if char in _SEGMENT_STRONG or weak_cut:
+            while index + 1 < total and source[index + 1] in _SEGMENT_CLOSERS:
+                index += 1
+                buf += source[index]
+            if len(buf.strip()) >= SEGMENT_MIN_CHARS:
+                pieces.append(buf.strip())
+                buf = ""
+        index += 1
+    tail = buf.strip()
+    if tail:
+        if pieces and len(tail) < SEGMENT_MIN_CHARS:
+            pieces[-1] = pieces[-1] + tail
+        else:
+            pieces.append(tail)
+    while len(pieces) > MAX_SPEECH_SEGMENTS:
+        # 合并最短的相邻对：上限是防御性的，优先消除最碎的接缝
+        best = min(range(len(pieces) - 1), key=lambda i: len(pieces[i]) + len(pieces[i + 1]))
+        pieces[best] = pieces[best] + pieces[best + 1]
+        del pieces[best + 1]
+    if len(pieces) <= 1:
+        return (source,)
+    return tuple(pieces)
+
+
 def edge_rate_arg(rate) -> str:
     """edge-tts rate 参数：如 +10% / -20% / +0%。"""
     value = clean_rate(rate)
@@ -593,11 +665,15 @@ def edge_pitch_arg(pitch) -> str:
     return f"{sign}{value}Hz"
 
 
-def cache_key(text: str, cfg: dict, provider_id: str | None = None) -> str:
-    """音频缓存文件名键：内容 + 该后端 flavor 的短哈希。
+def cache_key(text: str, cfg: dict, provider_id: str | None = None, extra: str = "") -> str:
+    """音频缓存文件名键：内容 + 该后端 flavor（+ provider 之外的补充指纹）的短哈希。
 
     flavor 由 provider 给（只含影响音频内容的参数），因此换后端 / 换音色 / 换风格都会
     换键，不同后端的缓存不会互串；edge 的 flavor 保持历史格式，老缓存升级后仍命中。
+    ``extra`` 是 provider 声明之外的补充指纹——典型是克隆音色的参考音频文件指纹
+    （provider 只声明「这个文件影响输出」，指纹算法在服务层，见
+    ``voice_chime_service._attempt_cache_extra``）。默认空串：既有调用点与老缓存键
+    逐字节不变。
     """
     import hashlib
 
@@ -611,4 +687,6 @@ def cache_key(text: str, cfg: dict, provider_id: str | None = None) -> str:
             # 紧凑调用（传的是原始 config 映射）：让 provider 自己按字段 key 取值
             values = provider.values(cfg)
         raw = f"{text}|{provider.flavor(values)}"
+    if extra:
+        raw = f"{raw}|{extra}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]

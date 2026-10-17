@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QFileDialog,
     QHBoxLayout,
     QLineEdit,
     QPlainTextEdit,
@@ -80,6 +81,7 @@ class VoiceChimeSettingsPage(QWidget):
         # 字段控件/行：按 (provider_id, 字段名) 与配置键索引，供显隐与读写使用
         self._field_widgets: dict[str, QWidget] = {}
         self._secret_edits: dict[str, QLineEdit] = {}
+        self._path_edits: dict[str, QLineEdit] = {}
         self._field_rows: dict[tuple[str, str], SettingRow] = {}
         self._secret_cleared: set[str] = set()
 
@@ -258,7 +260,7 @@ class VoiceChimeSettingsPage(QWidget):
         )
 
     def _build_field_widget(self, provider, spec: tts.TtsField) -> QWidget:
-        """按字段声明造控件（select / multiline / number / flag / secret / text）。"""
+        """按字段声明造控件（select / number / flag / secret / path / multiline / text）。"""
         current = provider.clean(spec, self.config.get(spec.key, spec.default))
         if spec.kind == "select":
             select = ModernSelect(self, width=230)
@@ -304,6 +306,23 @@ class VoiceChimeSettingsPage(QWidget):
             layout.addWidget(clear)
             self._secret_edits[spec.key] = edit
             return box
+        if spec.kind == "path":
+            # 本地文件（克隆参考音频这类）：路径输入框 + 浏览按钮；值就是路径字符串。
+            edit = QLineEdit(self)
+            edit.setPlaceholderText(spec.placeholder or "选择文件")
+            edit.setText(str(current or ""))
+            browse = QPushButton("浏览…", self)
+            browse.setObjectName("ttsPathBrowse")
+            browse.setToolTip("从电脑里选一个文件")
+            browse.clicked.connect(lambda _=False, s=spec: self._on_path_browse(s))
+            box = QWidget(self)
+            layout = QHBoxLayout(box)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(8)
+            layout.addWidget(edit)
+            layout.addWidget(browse)
+            self._path_edits[spec.key] = edit
+            return box
         if spec.kind == "multiline":
             # 整句描述（风格指令、音色描述）用多行框：单行框在设置页里根本看不全
             area = QPlainTextEdit(self)
@@ -330,11 +349,16 @@ class VoiceChimeSettingsPage(QWidget):
             "mimo_model_select": "voice_chime_mimo_model",
             "mimo_voice_select": "voice_chime_mimo_voice",
             "mimo_style_edit": "voice_chime_mimo_style",
+            "mimo_ref_audio_edit": "voice_chime_mimo_ref_audio",
             "mimo_key_edit": "voice_chime_mimo_api_key",
         }
         for name, key in aliases.items():
-            # 密钥类字段的容器是「输入框 + 清除按钮」，别名要指向输入框本身
-            widget = self._secret_edits.get(key) or self._field_widgets.get(key)
+            # 密钥/文件类字段的容器是「输入框 + 按钮」，别名要指向输入框本身
+            widget = (
+                self._secret_edits.get(key)
+                or self._path_edits.get(key)
+                or self._field_widgets.get(key)
+            )
             if widget is not None:
                 setattr(self, name, widget)
         # 行别名：切后端显隐的既有断言按名字取
@@ -344,6 +368,7 @@ class VoiceChimeSettingsPage(QWidget):
             "edge_pitch_row": ("edge", "pitch"),
             "mimo_model_row": ("mimo", "model"),
             "mimo_voice_row": ("mimo", "voice"),
+            "mimo_ref_audio_row": ("mimo", "ref_audio"),
             "mimo_style_row": ("mimo", "style"),
             "mimo_key_row": ("mimo", "api_key"),
         }.items():
@@ -367,13 +392,11 @@ class VoiceChimeSettingsPage(QWidget):
         visible: dict[str, dict[str, bool]] = {}
         for provider in tts.providers():
             values = self._current_field_values(provider)
-            row_visible: dict[str, bool] = {}
-            for spec in provider.fields:
-                show = True
-                if spec.hidden_when is not None:
-                    dep_name, dep_value = spec.hidden_when
-                    show = values.get(dep_name) != dep_value
-                row_visible[spec.name] = show
+            # 依赖显隐（hidden_when / visible_when）统一走 tts.field_visible：
+            # 设置页与服务层对「什么情况下这个字段有意义」的解释只有一份。
+            row_visible = {
+                spec.name: tts.field_visible(spec, values) for spec in provider.fields
+            }
             visible[provider.id] = row_visible
         self._tts_panel.apply(backend, visible)
         self._refresh_secret_hints()
@@ -401,9 +424,24 @@ class VoiceChimeSettingsPage(QWidget):
             return widget.currentData()
         if spec.kind == "secret":
             return self._secret_edits.get(spec.key).text().strip() if spec.key in self._secret_edits else ""
+        if spec.kind == "path":
+            edit = self._path_edits.get(spec.key)
+            return edit.text().strip() if edit is not None else ""
         if spec.kind == "multiline":
             return widget.toPlainText()
         return widget.text()
+
+    def _on_path_browse(self, spec: tts.TtsField) -> None:
+        """「浏览…」：从磁盘挑一个本地文件（过滤器按 provider 声明走）。"""
+        edit = self._path_edits.get(spec.key)
+        if edit is None:
+            return
+        path, _selected = QFileDialog.getOpenFileName(
+            self, f"选择{spec.label}", edit.text().strip(),
+            spec.file_filter or "所有文件 (*)",
+        )
+        if path:
+            edit.setText(path)
 
     def _on_secret_clear(self, spec: tts.TtsField) -> None:
         """清除已保存的凭据：立即生效（服务下一次合成即读不到）。"""

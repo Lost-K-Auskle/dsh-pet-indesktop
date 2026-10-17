@@ -72,6 +72,7 @@ def test_default_chime_config_has_all_flat_keys():
         "voice_chime_pitch",
         "voice_chime_mimo_model",
         "voice_chime_mimo_voice",
+        "voice_chime_mimo_ref_audio",
         "voice_chime_mimo_style",
         "voice_chime_sapi_rate",
         "voice_chime_sapi_voice",

@@ -1271,8 +1271,9 @@ class Config:
             # 本机 config.json 里的显式取值。
             "voice_chime_tts_backend": "edge",  # edge / mimo / sapi / doubao
             "voice_chime_tts_fallback": True,  # 主后端失败自动回退 edge
-            "voice_chime_mimo_model": "mimo-v2.5-tts",  # 或 mimo-v2.5-tts-voicedesign
+            "voice_chime_mimo_model": "mimo-v2.5-tts",  # 或 -voicedesign / -voiceclone
             "voice_chime_mimo_voice": "冰糖",  # 内置音色 id（中文名即 id）
+            "voice_chime_mimo_ref_audio": "",  # 克隆音色的参考音频路径（留空＝没选）
             "voice_chime_mimo_style": "",  # 风格指令（自然语言，留空用模型默认）
             "voice_chime_sapi_voice": "",  # SAPI5 本地音色（留空＝自动挑中文音色）
             "voice_chime_sapi_rate": 0,  # SAPI5 语速 −10..10（0 为系统默认）
@@ -1541,6 +1542,7 @@ class Config:
             "voice_chime_tts_fallback",
             "voice_chime_mimo_model",
             "voice_chime_mimo_voice",
+            "voice_chime_mimo_ref_audio",
             "voice_chime_mimo_style",
             "voice_chime_sapi_voice",
             "voice_chime_sapi_rate",

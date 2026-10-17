@@ -155,6 +155,7 @@ RELOAD_WHITELIST_SNAPSHOT = frozenset(
         "voice_chime_doubao_speaker",
         "voice_chime_enabled",
         "voice_chime_mimo_model",
+        "voice_chime_mimo_ref_audio",
         "voice_chime_mimo_style",
         "voice_chime_mimo_voice",
         "voice_chime_pitch",
@@ -214,6 +215,9 @@ SPECIAL_CASED_KEYS = frozenset({"version", "proactive_screen", "agent_link", "ch
 # 它们随「节日动画 + 我的生日」一起进来时**漏登在 config.py 的默认 dict 与白名单里**
 # （设置页有行、config 没键），于是本轮把它们渲染出来后被
 # `test_settings_default_marks` 的「冻结集」抓到——补齐后白名单 153。
+# 2026-10-15 加 MiMo 克隆音色参考音频 1 键（voice_chime_mimo_ref_audio，随
+# voiceclone 模型一起进来；config.py 那份是手写登记，别指望 provider 自动收编），
+# 白名单 154。
 DEFAULTS_SNAPSHOT = RELOAD_WHITELIST_SNAPSHOT | SPECIAL_CASED_KEYS
 
 

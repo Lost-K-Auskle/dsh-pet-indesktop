@@ -86,6 +86,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 import time
@@ -101,6 +102,7 @@ from .voice_chime import (
     chime_slot,
     next_chime_in_seconds,
     normalize_chime_config,
+    split_speech_segments,
     synth_attempts,
 )
 
@@ -187,6 +189,43 @@ def _cache_hit(path: Path) -> bool:
     不该做"多大才算完整"那类猜测。
     """
     return _nonempty_file(path)
+
+
+def _file_fingerprint(path_text) -> str:
+    """本地文件的内容指纹：``sha1(路径|大小|修改时间)[:16]``。
+
+    不读文件内容（省一次全量 IO）：大小 + ``st_mtime_ns`` 足够抓住「换文件 / 改过 /
+    重写同名」，去重质量与读内容等价（内容变了而三要素全同是理论边界）。文件不在 /
+    读不到 → 空串（此时合成必然报错走回退，键值不再重要）。
+    """
+    path = Path(str(path_text or ""))
+    try:
+        stat = path.stat()
+    except OSError:
+        return ""
+    stamp = f"{path}|{stat.st_size}|{stat.st_mtime_ns}"
+    return hashlib.sha1(stamp.encode("utf-8")).hexdigest()[:16]
+
+
+def _attempt_cache_extra(attempt: tts.TtsAttempt) -> str:
+    """一次合成尝试的补充缓存指纹：它声明的「内容影响输出」本地文件字段。
+
+    由 provider 声明（``kind="path"`` + ``affects_cache=True``，如 MiMo 克隆音色的
+    参考音频）、服务层算指纹——纯逻辑层不碰文件 IO。声明的意图是「同一个文件复用
+    缓存、换了文件必须换缓存」，被改动的参考音频绝不能播到旧克隆的缓存。
+    """
+    provider = tts.get(attempt.provider)
+    if provider is None:
+        return ""
+    parts: list[str] = []
+    for spec in provider.fields:
+        if spec.kind != "path" or not spec.affects_cache:
+            continue
+        value = provider.clean(spec, attempt.values.get(spec.name))
+        fingerprint = _file_fingerprint(value)
+        if fingerprint:  # 文件不在/读不到 → 不贡献指纹（此时合成会失败走回退）
+            parts.append(f"{spec.name}:{fingerprint}")
+    return "|".join(parts)
 
 
 def _temp_cache_path(out_path: Path) -> Path:
@@ -398,6 +437,64 @@ class _AudioBridge:
         return done
 
 
+class _SpeechJob:
+    """一次**分段**播报的作业对象（按标点切段、逐段合成、顺序播放）。
+
+    只在段数 > 1 时创建：单段（n==1）逐字走改动前的整句路径，作业不参与，
+    老行为与老缓存键一个字节都不变（切分规则见 ``split_speech_segments``）。
+
+    生命周期与不变量：
+    - 作业活跃期间 ``_busy``（有段合成在飞）与播放接管（``_player_engaged``，
+      正在播其中一段）共同保证 ``_channel_idle()`` 为假，于是既有排队语义
+      （speak / play_file / 两个补播队列）自动让路，不必新增判据；
+    - **预取不变量**：作业活跃且还有未就绪段 ⇒ **恰好一个**段合成在飞
+      （``inflight_index`` / ``inflight_generation``）——既不整段串行空等，
+      也不并发铺满（并发会撞 provider 速率限制，还会让后续段抢在首段前面完成）；
+    - **播放顺序**：``play_next`` 是下一个待播段的下标、单调递增；``playing``
+      表示播放器上正挂着本作业的一段（等媒体终止态来推进）。未被播放的段如果
+      合成失败只跳过该段（``failed``），其余段照播——整句一个字都不出是最后兜底；
+    - ``attached``：False = 预合成预热作业（等 ``_fire`` 到点认领），True = 已在播报。
+      认领前任何一次配置变更 / stop / 换槽位都可以整组作废（没有用户听过它）。
+    """
+
+    def __init__(self, full_text: str, segments: tuple[str, ...], now, bubble_text,
+                 show_bubble: bool, role: str, respect_quiet: bool, *,
+                 attempts, attached: bool) -> None:
+        self.full_text = full_text
+        self.segments = tuple(segments)
+        self.now = now
+        self.bubble_text = bubble_text
+        self.show_bubble = show_bubble
+        self.role = role
+        self.respect_quiet = respect_quiet
+        self.attempts = tuple(attempts)
+        self.attached = attached
+        # 段下标 → 最终缓存路径（合成成功）／失败段集合；首段失败的预合成整组作废
+        self.ready: dict[int, str] = {}
+        self.failed: set[int] = set()
+        self.first_error: str = ""
+        self.play_next = 0
+        self.playing = False
+        self.played_any = False
+        self.bubble_shown = False
+        self.inflight_index: int | None = None
+        self.inflight_generation: int | None = None
+
+    @property
+    def n(self) -> int:
+        return len(self.segments)
+
+    def finished(self) -> bool:
+        """整条作业是否已走完：没有在播段、没有在飞合成，且每段要么失败要么已播过。
+
+        "已播过"的判据是 ``play_next``（下一个待播段的下标，单调递增）：就绪但还没
+        轮到的段**不算**走完——那一段还要播，作业不能提前收口。
+        """
+        if self.playing or self.inflight_index is not None:
+            return False
+        return all(i in self.failed or i < self.play_next for i in range(self.n))
+
+
 class VoiceChimeService:
     """语音报时服务（AppShell 持有，GUI 线程）。
 
@@ -501,6 +598,10 @@ class VoiceChimeService:
         self._audio_out = None
         # 合成在飞时被 busy 门拦下的待补播报（_fire 排队，_on_synthesized 补播）
         self._queued_fire: tuple | None = None
+        # 分段播报作业（段数 > 1 才有；单段路径完全不碰它，见 _SpeechJob）。
+        # 一个时刻至多一条：新的播报要起播就抢占旧的（与缓存命中的抢占语义同口径），
+        # 预合成预热作业（attached=False）也要么被认领要么被作废，不并存两条。
+        self._job: _SpeechJob | None = None
         self._timer = QTimer()
         self._timer.setInterval(self.TICK_INTERVAL_MS)
         self._timer.timeout.connect(self._on_tick)
@@ -541,6 +642,10 @@ class VoiceChimeService:
         # 正在出声的这一段必须立刻停：关掉开关/退出后继续放完，用户听到的就是
         # "关不掉"；退出路径上播放器还可能正被析构。
         self._stop_current_segment()
+        # 分段作业整组作废（含只等通道、还没起播的，以及未认领的预热作业）：
+        # 关掉开关/退出之后不该再出声。_stop_current_segment 只收"正在播的那一段"
+        # 所属的作业——服务级停止比它更宽，这里补上。
+        self._kill_job()
         # 待播队列同样作废：关掉开关/退出后不该再补播一条排队的语音。
         self._pending_speech = None
         self._queued_fire = None
@@ -570,6 +675,13 @@ class VoiceChimeService:
         config = getattr(self._app, "config", None)
         self._cfg = normalize_chime_config(config if config is not None else {})
         # 配置变更后预合成缓存可能失效（音色/语速/台词开关/时间点变化），丢弃。
+        # 预热中的分段作业一并作废（它的 attempts 与段文本都是按旧配置定的，没人
+        # 听过它；下一次 _maybe_precache 会按新配置重热）。**已认领的作业不碰**：
+        # 用户正在听它，配置保存不该把放到一半的报时拦腰截断（与"正在出声的段
+        # 不因配置变更而停"同一条口径，见 _on_quiet_state_changed）。
+        job = getattr(self, "_job", None)
+        if job is not None and not job.attached:
+            self._kill_job()
         self._precache_slot = None
         self._precache_text = None
         self._precache_bubble = None
@@ -716,6 +828,10 @@ class VoiceChimeService:
                 self._precache_text = None
                 self._precache_bubble = None
                 self._precache_path = None
+                # 分段预热作业同属这一组占位：槽位已过，整组作废（没人听过它）。
+                job = getattr(self, "_job", None)
+                if job is not None and not job.attached:
+                    self._kill_job()
         # 免打扰期间不预合成：这次报时到点会被静音闸丢掉，合成等于白跑一趟
         # 网络请求（退出免打扰后又回到即时合成的既有回退路径）。
         if self._quiet_muted():
@@ -735,11 +851,28 @@ class VoiceChimeService:
         sentence = build_chime_sentence(next_at, self._cfg)
         bubble = build_bubble_sentence(next_at, self._cfg)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
-        paths = [self._cache_path(sentence, attempt) for attempt in attempts]
         # 先占位：即便本次合成未在报时点前完成，到点也会回退即时合成。
         self._precache_slot = next_slot
         self._precache_text = sentence
         self._precache_bubble = bubble
+        segments = split_speech_segments(sentence)
+        if len(segments) > 1:
+            # —— 分段预合成：顺序预热全部段（每段单独合成一次、写各自缓存）。
+            # 一个时刻至多一条作业：残留的**未认领**作业（旧槽/旧配置）先作废；
+            # 已认领的作业正在响，轮不到预合成插队（上面的 _busy 门也拦着）。
+            job = getattr(self, "_job", None)
+            if job is not None and not job.attached:
+                self._kill_job()
+            # 分段路径没有"整句文件"：_precache_path 保持 None，就绪判据是作业
+            # 首段（见 _consume_precache 的分段分支）。
+            self._precache_path = None
+            self._job = _SpeechJob(sentence, segments, next_at, bubble, True, "play", True,
+                                   attempts=attempts, attached=False)
+            logger.info("预合成下一报时音频（分段 %d 段，%ds 后）：%s",
+                        len(segments), next_secs, sentence[:20])
+            self._pump_job()
+            return
+        paths = [self._cache_path(sentence, attempt) for attempt in attempts]
         self._precache_path = next((str(p) for p in paths if _cache_hit(p)), None)
         if self._precache_path:
             logger.info("预合成命中已有缓存：%s", Path(self._precache_path).name)
@@ -763,17 +896,35 @@ class VoiceChimeService:
 
         无论命中与否都清空整组预合成状态（含气泡文本）：气泡文本由调用方
         ``_on_tick`` 在消费前取用，避免残留串到下一次报时。
+
+        **分段预合成**的就绪判据是**首段**（``_precache_path`` 为 None，在场的是
+        未认领的预热作业）：首段就绪即返回整句文本——调用方随即 ``_fire``，由
+        ``_fire_segmented`` 认领同一作业、直接起播首段，其余段边播边备。首段未
+        就绪则按未命中处理（回退即时合成），但**不动那个作业**：即时路径会按同一
+        文本认领它继续等首段，那条在飞的合成不浪费（作废反而会重复请求一次）。
         """
-        if self._precache_slot == slot and self._precache_path:
-            path = Path(self._precache_path)
-            if path.is_file():
-                text = self._precache_text
-                self._precache_slot = None
-                self._precache_text = None
-                self._precache_bubble = None
-                self._precache_path = None
-                logger.info("报时命中预合成缓存：%s", path.name)
-                return text
+        if self._precache_slot == slot:
+            if self._precache_path:
+                path = Path(self._precache_path)
+                if path.is_file():
+                    text = self._precache_text
+                    self._precache_slot = None
+                    self._precache_text = None
+                    self._precache_bubble = None
+                    self._precache_path = None
+                    logger.info("报时命中预合成缓存：%s", path.name)
+                    return text
+            else:
+                job = getattr(self, "_job", None)
+                if (job is not None and not job.attached
+                        and job.full_text == self._precache_text and 0 in job.ready):
+                    text = self._precache_text
+                    self._precache_slot = None
+                    self._precache_text = None
+                    self._precache_bubble = None
+                    self._precache_path = None
+                    logger.info("报时命中预合成缓存（分段，首段已就绪）：%s", text[:20])
+                    return text
         self._precache_slot = None
         self._precache_text = None
         self._precache_bubble = None
@@ -831,8 +982,15 @@ class VoiceChimeService:
         self._bubble(note)
 
     def _cache_path(self, text: str, attempt: tts.TtsAttempt) -> Path:
-        """该后端该文本的缓存路径（扩展名由 provider 的合成计划给出）。"""
-        key = cache_key(text, self._cfg, provider_id=attempt.provider)
+        """该后端该文本的缓存路径（扩展名由 provider 的合成计划给出）。
+
+        ``extra`` 带上 attempt 声明的本地文件指纹（如克隆音色的参考音频）：
+        同一套声音参数下换了参考文件必须换缓存键，否则新音频播的是旧克隆的结果。
+        """
+        key = cache_key(
+            text, self._cfg, provider_id=attempt.provider,
+            extra=_attempt_cache_extra(attempt),
+        )
         return self._cache_dir / f"{key}.{attempt.ext}"
 
     def _fire(self, sentence: str, now: datetime, bubble_text: str | None = None,
@@ -874,6 +1032,13 @@ class VoiceChimeService:
         for out_path in paths:
             if not _cache_hit(out_path):
                 continue
+            # 整句缓存命中 = 立即起播（抢占语义）：**在播的**分段作业被顶掉——它的
+            # 在飞段合成作废、播放记账清掉（正在响的那一段由本次 setSource 接替）。
+            # 未认领的预热作业不碰：它是后台预热，与"现在播什么"无关，作废它只是
+            # 白白让下一次报时丢掉预热（它的段缓存留在盘上，重热时直接命中）。
+            job = getattr(self, "_job", None)
+            if job is not None and job.attached:
+                self._kill_job()
             # 起播前记下这一段的免打扰口径：免打扰在它播放**期间**才生效时按它决定
             # 切不切（见 _on_quiet_state_changed）。放在这里而不是播放方法里，是为了
             # 写入口径的地方与决定"播什么"的地方同一处。
@@ -883,6 +1048,18 @@ class VoiceChimeService:
             else:
                 self._play_only(str(out_path))
             return
+        segments = split_speech_segments(sentence)
+        if len(segments) > 1:
+            job = getattr(self, "_job", None)
+            if job is not None and not job.attached and job.full_text == sentence:
+                # 认领预合成预热作业：**在 busy 门之前**路由——"合成在飞"的那一枚
+                # 很可能正是本作业的首段（预合成没赶在报时点前做完），走 busy 门
+                # 排队会一直等到整组热完才出声（首声延迟反而比整句合成更差）；
+                # 认领不新起合成（单飞不变量仍由 _start_job_segment 把守）。
+                self._fire_segmented(sentence, segments, now, bubble, attempts,
+                                     show_bubble=show_bubble, role=role,
+                                     respect_quiet=respect_quiet)
+                return
         if self._busy:
             # 合成在飞（多为本次报时的预合成）：排队待补，不得直接丢弃——
             # 到点回退即时合成正经此路径（_on_tick 在预合成未完成时调 _fire，
@@ -893,6 +1070,14 @@ class VoiceChimeService:
             # 当前音频播完。通道占用的收敛点在两个出队口，不在这里。
             self._queued_fire = (sentence, now, bubble_text, show_bubble, role, respect_quiet)
             logger.info("语音报时合成在飞，排队待补：%s", sentence[:20])
+            return
+        if len(segments) > 1:
+            # 长文本：按标点分段、逐段合成、逐段顺序播放——首段合成完即出声，
+            # 后续段在播放期间备好（用户要求：减少"听到开头"前的等待体感）。
+            # 单段（n==1）落回下面的整句路径，老行为与老缓存键逐字不变。
+            self._fire_segmented(sentence, segments, now, bubble, attempts,
+                                 show_bubble=show_bubble, role=role,
+                                 respect_quiet=respect_quiet)
             return
         self._busy = True
         self._busy_since = time.monotonic()
@@ -907,6 +1092,194 @@ class VoiceChimeService:
         generation = self._next_synthesis_generation()
         worker = _TTSWorker(sentence, attempts, paths, self._worker_callback(generation))
         worker.start()
+
+    # ------------------------------------------------------------ 分段作业
+    def _fire_segmented(self, sentence: str, segments: tuple[str, ...], now: datetime,
+                        bubble_text: str | None, attempts, *, show_bubble: bool,
+                        role: str, respect_quiet: bool) -> None:
+        """分段播报的一次点火：认领预热作业，或新建作业后立即推进。
+
+        调用方 ``_fire`` 已过完两道闸（免打扰静音闸、尝试序列可用性）与整句缓存
+        命中判定，这里不重复判；``attempts`` 是它算好的尝试序列（preflight 已把
+        下架音色换掉，缓存键与之一致），不再重算。
+
+        作业来源只有两条：
+        - **认领**：场上正好是同一整句的未认领预热作业——挂上本次的播报身份与展示
+          参数后接着推进：首段已就绪就立刻出声，未就绪就等那枚在飞的合成（不重发
+          请求、不重切段）；
+        - **新建**：其余情况一律新建，且**先作废场上任何作业**——新的播报要起播就
+          抢占旧的（与整句缓存命中的抢占语义同口径，见 ``_SpeechJob`` 的说明）。
+        """
+        job = getattr(self, "_job", None)
+        if job is not None and not job.attached and job.full_text == sentence:
+            job.attached = True
+            job.now = now
+            job.bubble_text = bubble_text
+            job.show_bubble = show_bubble
+            job.role = role
+            job.respect_quiet = respect_quiet
+            # 预热期失败的段到点重试：用户真要听这一条了，再给它们一次机会
+            # （首段失败在预热期就作废整组，见 _pump_job 的收尾）。
+            job.failed.clear()
+            self._stopped = False
+            logger.info("认领分段预合成作业（%d 段）：%s", job.n, sentence[:20])
+            self._pump_job(allow_engaged=True)
+            return
+        if job is not None:
+            self._kill_job()
+        job = _SpeechJob(sentence, segments, now, bubble_text, show_bubble, role,
+                         respect_quiet, attempts=attempts, attached=True)
+        self._job = job
+        # 本次作业有效：清掉上一次 stop() 留下的作废标记（同 _fire 的整句路径）
+        self._stopped = False
+        logger.info("分段播报（%d 段）：%s", job.n, sentence[:20])
+        self._pump_job(allow_engaged=True)
+
+    def _pump_job(self, *, allow_engaged: bool = False) -> None:
+        """推进分段作业：预取一段 → 顺序起播 → 收尾判定（幂等，可重复调用）。
+
+        调用点：段合成完成（``_on_synthesized`` 的收口）、媒体终止态
+        （``_on_media_status``）、通道治愈（``_on_player_error`` /
+        ``_release_stale_play_pending``）、点火 / 认领（``_fire_segmented``）。
+        顺序刻意是"先预取、后起播"：起播一段的同时就把下一段送进合成线程，播放与
+        合成并行，段与段之间不留网络空档。
+
+        ``allow_engaged`` 只由点火 / 认领传 True：那条路与整句**缓存命中**同口径
+        （"报时经缓存例外"）——报时点到了，备好的首段立刻出声，可以顶掉在播的别的
+        音频。其余调用点（合成完成、END、治愈）一律 False：此刻起播会顶掉刚被用户
+        触发的音频（点击自言等），与整句路径的"回队不播"是同一条口径——作业就地
+        等待，下一个"通道空出"的拍子（END / 错误 / 治愈）再 pump。
+        """
+        job = getattr(self, "_job", None)
+        if job is None or getattr(self, "_stopped", False):
+            return
+        if job.attached and job.respect_quiet and self._quiet_muted():
+            # 合成期间才进入免打扰（同整句路径 _handle_synthesized 的口径）：整组
+            # 丢弃（**连下一段的合成都别再起**——这就是这道闸放在预取之前的原因），
+            # 气泡仍按既有语义走（role != "speak"），且只随"该出声的那一刻"展示一次。
+            if job.role != "speak" and not job.bubble_shown:
+                job.bubble_shown = True
+                self._bubble(job.bubble_text if job.bubble_text is not None
+                             else job.full_text)
+            logger.debug("免打扰期间静音，丢弃分段播报（%d 段）", job.n)
+            if job.playing:
+                # 它的段正挂在播放器上（免打扰边沿通常已先切掉，这里是兜底）：
+                # 连播放器一起停，不能只作废记账——那一段会继续响到播完。
+                self._stop_current_segment()
+            else:
+                self._kill_job()
+            return
+        # 1) 预取不变量：恰好一个段合成在飞（未认领的预热作业只做这一步）
+        self._start_job_segment(job)
+        if not job.attached:
+            return
+        # 2) 顺序播放：没有在播段时起播最小未播段（失败段跳过）
+        if not job.playing:
+            index = job.play_next
+            while index < job.n and index in job.failed:
+                index += 1
+            if index < job.n and index in job.ready:
+                if not allow_engaged and self._player_engaged():
+                    # 通道被别的音频接管（播放中 / 刚起播）：不顶播，就地等待
+                    logger.debug("分段播报等待通道空出：%s", job.segments[index][:20])
+                    return
+                if not self._play_job_segment(job, index):
+                    # 起播失败（播放器建不起来 / 设备异常）：整条出不了声，作废
+                    # （失败提示已由播放出口按各自口径冒过，这里不重复）
+                    self._kill_job()
+                    return
+                job.play_next = index + 1
+                job.playing = True
+                job.played_any = True
+                return  # 等媒体终止态推进（下一拍见 _on_media_status）
+        # 3) 收尾：每段都有结局（播完或失败）且没有在飞合成 → 整组收口
+        if job.finished():
+            self._finish_job(job)
+
+    def _start_job_segment(self, job: _SpeechJob) -> None:
+        """保证"恰好一个段合成在飞"：没有在飞时按段序取最小的未决段起合成。
+
+        已缓存过的段直接记为就绪（零网络）并继续往后找；整条都命中缓存时一个请求
+        都不发。另有合成在飞（整句路径 / 本作业的某一段）时让路——那枚回调的收口
+        会再 pump 一次（见 ``_on_synthesized``），不在这里并发铺开。
+        """
+        if job.inflight_index is not None or getattr(self, "_busy", False):
+            return
+        if getattr(self, "_stopped", False):
+            return
+        for index in range(job.n):
+            if index in job.ready or index in job.failed:
+                continue
+            paths = [self._cache_path(job.segments[index], attempt)
+                     for attempt in job.attempts]
+            hit = next((str(p) for p in paths if _cache_hit(p)), None)
+            if hit is not None:
+                job.ready[index] = hit
+                continue
+            self._busy = True
+            self._busy_since = time.monotonic()
+            self._reararm_watchdog()
+            generation = self._next_synthesis_generation()
+            job.inflight_index = index
+            job.inflight_generation = generation
+            worker = _TTSWorker(job.segments[index], job.attempts, paths,
+                                self._worker_callback(generation))
+            logger.info("分段合成第 %d/%d 段：%s", index + 1, job.n,
+                        job.segments[index][:20])
+            worker.start()
+            return
+
+    def _play_job_segment(self, job: _SpeechJob, index: int) -> bool:
+        """把作业的某一段交给播放器；气泡只随**首个出声段**展示一次。
+
+        返回是否成功起播。免打扰口径与整句路径同源：起播前写
+        ``_current_respect_quiet``（免打扰在播放**期间**才生效时据此切段，见
+        ``_on_quiet_state_changed``）。**不判通道占用**——分段播放与整句缓存命中
+        同属"抢占语义"：新的一段要出声，``setSource`` 就接替在响的那一段。
+        """
+        path = job.ready.get(index)
+        if not path:
+            return False
+        self._current_respect_quiet = job.respect_quiet
+        if job.role == "speak" or not job.show_bubble or job.bubble_shown:
+            # 后续段只出声：气泡已经随首段展示过，重复展示会反复刷新倒计时
+            return self._play_only(path)
+        ok = self._play_and_bubble(path, job.segments[index], job.bubble_text)
+        if ok:
+            job.bubble_shown = True
+        return ok
+
+    def _finish_job(self, job: _SpeechJob) -> None:
+        """作业收口：放掉槽位；一个字都没出过声时按失败口径冒一次气泡。"""
+        if getattr(self, "_job", None) is job:
+            self._job = None
+        if (not job.played_any and not job.bubble_shown and job.role == "play"
+                and not getattr(self, "_stopped", False)):
+            reason = (job.first_error or "无可用语音")[:40]
+            self._bubble(f"语音合成失败（{reason}…）")
+        logger.info("分段播报结束（%d 段，出声：%s）", job.n,
+                    "有" if job.played_any else "无")
+
+    def _kill_job(self) -> None:
+        """整组作废当前分段作业（**不碰播放器**）。
+
+        不碰播放器是刻意的：抢占时正在响的旧段由新首段的 ``setSource`` 无声接替
+        （先停会留一段静音空档）；真要停播放器的调用方（``stop()`` / 免打扰切断 /
+        播放接管超时治愈）本来就会先调 ``_stop_current_segment``，而它反过来调本
+        方法——两者不是互相调用（见各自说明）。
+
+        在飞段合成一并作废：代次递增让它的迟到回调整条丢弃，合成锁当场放掉
+        （那一枚 ``_busy`` 属于本作业，此后没人会认领它的回调）。
+        """
+        job = getattr(self, "_job", None)
+        if job is None:
+            return
+        self._job = None
+        if job.inflight_index is not None:
+            self._next_synthesis_generation()
+            self._busy = False
+            self._busy_since = 0.0
+            self._disarm_unlock_timer()
 
     def _reararm_watchdog(self) -> None:
         """按**最近的一个未结期限**布看门狗表；两个期限都没有就撤表。
@@ -986,23 +1359,47 @@ class VoiceChimeService:
         代次不一致 = 这次合成的结果已作废（超时自愈释放过、当前在跑的是别的一路）：
         整条丢弃——一个字段都不碰。否则旧任务会取走**新任务**的 role /
         respect_quiet 与 busy 锁：该被静音的旧提醒出声、应豁免的新语音被静音。
+
+        代次相符时先认**分段作业**的段合成（作业在场、且代次正是它那一枚在飞）：
+        只记账（就绪 / 失败），推进统一交给收口的 ``_pump_job``；否则才是整句路径
+        的老流程。两条路的收口都要先 pump 再 drain：pump 起播的那一段先接管通道，
+        两个补播队列据此（``_channel_idle``）原样留队，等 END 再结。
         """
         if generation != getattr(self, "_synthesis_generation", None):
             logger.debug("丢弃已作废旧合成的迟到结果（代次 %s，当前 %s）：%s",
                          generation, getattr(self, "_synthesis_generation", None),
                          Path(path).name)
             return
-        role = self._synthesis_role
-        self._synthesis_role = "play"
-        respect_quiet = self._synthesis_respect_quiet
-        self._synthesis_respect_quiet = True
-        self._busy = False
-        # 本次合成已有结局：**结算**看门狗表（不是裸撤）——播放接管那一支可能还挂着
-        # （手动通道没有 tick，撤了就再也没人续命），由 _disarm_unlock_timer 按剩余
-        # 期限重算。若 drain 又起了新合成，_fire 会重新布一道。
-        self._disarm_unlock_timer()
+        job = getattr(self, "_job", None)
         try:
-            self._handle_synthesized(role, path, text, error, respect_quiet)
+            if job is not None and job.inflight_generation == generation:
+                # —— 分段作业的段合成回调
+                index = job.inflight_index
+                job.inflight_index = None
+                job.inflight_generation = None
+                self._busy = False
+                # 这一支结了：**结算**看门狗表（播放接管那一支可能还挂着）
+                self._disarm_unlock_timer()
+                if not getattr(self, "_stopped", False):
+                    if error:
+                        if index is not None:
+                            job.failed.add(index)
+                        if not job.first_error:
+                            job.first_error = error
+                        logger.warning("分段播报第 %s 段合成失败：%s", index, error)
+                    elif index is not None:
+                        job.ready[index] = str(path)
+            else:
+                role = self._synthesis_role
+                self._synthesis_role = "play"
+                respect_quiet = self._synthesis_respect_quiet
+                self._synthesis_respect_quiet = True
+                self._busy = False
+                # 本次合成已有结局：**结算**看门狗表（不是裸撤）——播放接管那一支可能还挂着
+                # （手动通道没有 tick，撤了就再也没人续命），由 _disarm_unlock_timer 按剩余
+                # 期限重算。若 drain 又起了新合成，_fire 会重新布一道。
+                self._disarm_unlock_timer()
+                self._handle_synthesized(role, path, text, error, respect_quiet)
         finally:
             # 任何结局（完成/失败/已停止）都必须结算排队项：_stopped 时
             # _drain 内部丢弃，其余情况补播——不能让到点报时静默消失。
@@ -1010,8 +1407,16 @@ class VoiceChimeService:
             # 起了播的完成 → 通道被接管 → 两个队列都原样留队（EndOfMedia 再结算）；
             # 没起播的完成（预合成 / 免打扰丢弃 / 合成失败 / 已停止）→ 通道空出却
             # 没有 EndOfMedia → 就在此结清。
-            # 顺序是「先 _drain_queued_fire」：待补播的报时若在此起了合成，待播语音
-            # 会被留队（豁免随队携带），等下一拍——报时优先，且条目不丢。
+            # 顺序分两种：**已认领**的作业先 pump（可能起播下一段接管通道）再 drain
+            # ——待补播的报时若在此起了合成，待播语音会被留队（豁免随队携带），等
+            # 下一拍，报时优先且条目不丢；**预热**作业反过来先 drain：它没有在播段
+            # 要保护，而 pump 会立刻续热下一段（_busy 再置位）——若先 pump，预热就
+            # 会挡死用户刚点出来的那一声（到整组热完才出队）。
+            job = getattr(self, "_job", None)
+            if job is not None and not job.attached:
+                self._drain_queued_fire()
+                self._drain_pending_speech()
+            self._pump_job()
             self._drain_queued_fire()
             self._drain_pending_speech()
 
@@ -1113,19 +1518,21 @@ class VoiceChimeService:
         self._current_respect_quiet = respect_quiet
         self._play_and_bubble(path, text, self._pending_bubble)
 
-    def _play_and_bubble(self, path: str, text: str, bubble_text: str | None = None) -> None:
-        """播放音频并展示气泡。
+    def _play_and_bubble(self, path: str, text: str, bubble_text: str | None = None) -> bool:
+        """播放音频并展示气泡；返回是否成功起播（播放器建不起来 / 设备异常时 False）。
 
         ``text`` 为语音口播文本（中文数字）；气泡优先用 ``bubble_text``
         （阿拉伯数字文本），未传时回退 ``text`（兼容旧调用与测试）。
 
         **本方法不判通道占用**：它是"把这一段交给播放器"的执行末端，占用判定归
         调用方（``_handle_synthesized`` 的播放出口、``_fire`` 的缓存命中路径）。
-        在这里加判据会变成静默不播，而回队的语义只能由调用方给。
+        在这里加判据会变成静默不播，而回队的语义只能由调用方给。返回值是给
+        分段作业用的（``_play_job_segment``）：起播失败要当场作废，不能把
+        "已起播"的记账挂在一次失败上。
         """
         if not self._ensure_player():
             self._bubble(f"播放器不可用，音频已缓存：{Path(path).name}")
-            return
+            return False
         try:
             from PySide6.QtCore import QUrl
 
@@ -1138,8 +1545,9 @@ class VoiceChimeService:
         except Exception:
             logger.exception("语音报时播放失败：%s", path)
             self._bubble("语音播放失败（设备/解码器异常）")
-            return
+            return False
         self._bubble(bubble_text if bubble_text is not None else text)
+        return True
 
     def _play_only(self, path: str) -> bool:
         """只播放音频、不展示气泡（外部播报用，气泡由调用方自己管）。
@@ -1286,6 +1694,13 @@ class VoiceChimeService:
         # 判据不成立，只剩这个标志撑着）。
         self._clear_play_pending()
         self._current_respect_quiet = None
+        # 分段作业：在播段结束 → 放掉播放记账，由 pump 起播下一段（或收尾）。
+        # 判据是 ``job.playing``（不是"通道被谁占用"）：作业在播期间只有它的段
+        # 会到播放器上（抢占方一律先把作业作废，见 _kill_job 的调用点）。
+        job = getattr(self, "_job", None)
+        if job is not None and job.playing:
+            job.playing = False
+        self._pump_job()
         self._drain_queued_fire()
         self._drain_pending_speech()
 
@@ -1304,6 +1719,13 @@ class VoiceChimeService:
         logger.warning("音频播放错误，按通道空出结算：%s（%s）", error, error_string)
         self._clear_play_pending()
         self._current_respect_quiet = None
+        # 分段作业：出错的是它正在播的那一段 → 整组作废（后续段多半也放不出来，
+        # 硬留只会让泵在"等一个永远不来的终止态"上挂死）；只等通道、还没起播的
+        # 作业不在此列——下面照样 pump，由它按当时现状决定播或弃。
+        job = getattr(self, "_job", None)
+        if job is not None and job.playing:
+            self._kill_job()
+        self._pump_job()
         self._drain_queued_fire()
         self._drain_pending_speech()
 
@@ -1411,6 +1833,10 @@ class VoiceChimeService:
             return
         logger.info("免打扰生效，停止正在播放的语音")
         self._stop_current_segment()
+        # 等通道、还没起播的分段作业（尊重免打扰的那类）也就地弃掉：它的下一拍
+        # pump 本来就会在播前过静音闸，这里补一推是为了不必等下一个偶然事件——
+        # 与 ``_fire`` 的丢弃语义一致，不留到免打扰结束后补播一条过期的报时。
+        self._pump_job()
         # 停掉这一段 = 通道空出，但**没有 EndOfMedia**（player.stop() 不产生媒体终止
         # 事件），与"合成完成却没起播"是同一类结局：两个补播队列必须在这一拍结清，
         # 否则留队的条目要等下一次合成完成（可能永远不来）。同序结算（报时优先），
@@ -1427,6 +1853,9 @@ class VoiceChimeService:
         :meth:`_unload_player_source`），只停不清就会留下 `LoadingMedia` 判忙——三个
         调用方谁撞上这个死局都一样永久判忙（手动通道没有 tick）。清载没有副作用：
         下一段起播前 ``_play_and_bubble`` 本来就会 ``setSource`` 新源。
+
+        停掉的这一段若属于分段作业，作业整组作废（``_kill_job``）：被停的段等不到
+        终止态来推进，留着作业就是让泵永远挂在一个"在播"的假象上。
         """
         player = self._player
         if player is not None:
@@ -1442,6 +1871,14 @@ class VoiceChimeService:
         # 会被永久判忙（_player_engaged 的第三个子判据）。
         self._clear_play_pending()
         self._current_respect_quiet = None
+        # 停掉的是分段作业**正在播的那一段** → 作业整组就地作废：被停的段等不到终止
+        # 态来推进（playing 会永远为真、泵从此挂死），而三个调用方的语义都是"接下来
+        # 不该再出声"（关闭开关 / 免打扰切断 / 播放接管超时治愈）。**只等通道、还没
+        # 起播的作业不受牵连**：它没被停（播放器上不是它的段），下一次 pump 自会按
+        # 当时的免打扰 / 占用现状决定播或弃——停的是别人的段，不该迁怒于它。
+        job = getattr(self, "_job", None)
+        if job is not None and job.playing:
+            self._kill_job()
 
     # ------------------------------------------------------------ 提示
     def _quiet_muted(self) -> bool:
@@ -1554,6 +1991,19 @@ class VoiceChimeService:
         # 回调带的旧代次会被 _on_synthesized 认出来并整条丢弃，不会串到随后起的
         # 新任务上（取走新任务的 role / respect_quiet / busy 锁）。
         self._next_synthesis_generation()
+        # 分段作业：挂死的是它的某一段 → 按**失败**记账（跳过该段，其余段照播；
+        # 一个段超时不该让整条作业永远卡在"有一个段在飞"上）。整条都没出声时由
+        # 收尾判定统一冒失败气泡（见 _finish_job）。
+        job = getattr(self, "_job", None)
+        if job is not None and job.inflight_index is not None:
+            index = job.inflight_index
+            job.inflight_index = None
+            job.inflight_generation = None
+            job.failed.add(index)
+            if not job.first_error:
+                job.first_error = "合成超时"
+            logger.warning("分段播报第 %s 段合成超时，跳过该段", index)
+        self._pump_job()
         # 合成锁复位后结算排队项：挂死的合成不会再来回调，到点报时靠这里补。
         # 两个队列同序结算（报时优先），判据在 drain 内部——这里是超时自愈这一拍，
         # 不结算待播语音就会让它永远没人出队（挂死的合成也不会再产生 END）。
@@ -1602,6 +2052,9 @@ class VoiceChimeService:
                        _PLAY_PENDING_MAX_S)
         # 停住这一段 + 清空音源（_stop_current_segment 内统一做，见那里）
         self._stop_current_segment()
+        # 通道已治愈 = 可以重新起播：等通道的分段作业在这里再推一拍（正在播的那一段
+        # 所属的作业已被 _stop_current_segment 作废，这里是"只等通道"的那种）。
+        self._pump_job()
         self._drain_queued_fire()
         self._drain_pending_speech()
 

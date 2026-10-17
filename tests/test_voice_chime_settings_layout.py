@@ -25,7 +25,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pet import tts  # noqa: E402
 from pet.settings_widgets import SettingRow, SettingsCard  # noqa: E402
-from pet.voice_chime import DEFAULT_BACKEND, clean_backend, default_chime_config  # noqa: E402
+from pet.voice_chime import (  # noqa: E402
+    DEFAULT_BACKEND,
+    MIMO_MODEL_VOICE_CLONE,
+    MIMO_MODEL_VOICE_DESIGN,
+    clean_backend,
+    default_chime_config,
+)
 from pet.voice_chime_settings import VoiceChimeSettingsPage  # noqa: E402
 from pet.voice_chime_tts_panel import (  # noqa: E402
     COLLAPSE_TEXT,
@@ -126,9 +132,13 @@ def test_fold_button_expands_and_collapses_a_backend(tmp_path):
     button.click()
     assert button.text() == COLLAPSE_TEXT
     for spec in tts.get("mimo").fields:
-        assert page._field_rows[("mimo", spec.name)].isVisibleTo(page), (
-            f"展开后 {spec.name} 必须可见"
-        )
+        row = page._field_rows[("mimo", spec.name)]
+        if spec.visible_when is not None:
+            # 依赖没满足的行（默认模型下的「参考音频」）展开也不出现——那是
+            # 字段间依赖，不是折叠；见 test_clone_model_reveals_ref_audio…
+            assert not row.isVisibleTo(page), f"依赖未满足的 {spec.name} 展开也不该出现"
+            continue
+        assert row.isVisibleTo(page), f"展开后 {spec.name} 必须可见"
 
     button.click()
     assert button.text() == EXPAND_TEXT
@@ -183,6 +193,24 @@ def test_dependency_hidden_field_stays_hidden_when_its_backend_is_expanded(tmp_p
 
     page.backend_select.setCurrentData("mimo")
     assert page._field_rows[("mimo", "style")].isVisibleTo(page)
+    assert not page._field_rows[("mimo", "voice")].isVisibleTo(page)
+
+
+def test_clone_model_reveals_ref_audio_and_folds_the_voice_row(tmp_path):
+    """克隆音色：参考音频行跟着模型出现，内置音色行同时收起（两种音色来源互斥）。"""
+    page = _page(tmp_path, backend="mimo")
+    ref_row = page._field_rows[("mimo", "ref_audio")]
+    assert not ref_row.isVisibleTo(page), "内置音色模型下没有参考音频要填"
+
+    model_select = page._field_widgets["voice_chime_mimo_model"]
+    model_select.setCurrentData(MIMO_MODEL_VOICE_CLONE)
+    assert ref_row.isVisibleTo(page), "选了克隆音色，参考音频行必须出来"
+    assert not page._field_rows[("mimo", "voice")].isVisibleTo(page), (
+        "克隆音色的声音来自参考音频，内置音色行收起"
+    )
+
+    model_select.setCurrentData(MIMO_MODEL_VOICE_DESIGN)
+    assert not ref_row.isVisibleTo(page), "音色设计也不需要参考音频"
     assert not page._field_rows[("mimo", "voice")].isVisibleTo(page)
 
 

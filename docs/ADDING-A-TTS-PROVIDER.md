@@ -3,7 +3,7 @@
 语音报时的合成后端是**注册表 + 声明式 provider**：核心代码（调度、缓存、设置页、
 服务层）只认接口，不认具体厂家。接入新 TTS 的标准动作是「加一个模块 + 在包里注册
 它」，**不需要改** `voice_chime.py` / `voice_chime_service.py` / `voice_chime_settings.py`
-（配置键由 provider 自己声明，`config.py` 会自动收编）。
+（配置键由 provider 自己声明，另需在 `config.py` 手写登记两处，见第 3 步）。
 
 > 代码位置：接口与注册表 `pet/tts/base.py`；内置实现 `pet/tts/edge.py`（edge-tts）、
 > `pet/tts/mimo.py`（小米 MiMo）。契约由 `tests/test_voice_chime_mimo.py::
@@ -65,11 +65,14 @@ from . import edge, mimo, mytts  # noqa: F401 —— import 即注册
 注册顺序决定设置页下拉顺序；被标了 `is_fallback = True` 的会进回退链，
 所以**别把多个后端都标成 fallback**，除非你确实想要一条多级链。
 
-### 3. 在 `pet/config.py` 里什么都不用做
+### 3. 在 `pet/config.py` 里手写登记字段键（**不会**自动收编）
 
-`Config.__init__` 与 `reload()` 会遍历 `tts.providers()` 把每个字段的 `key`
-自动收进默认值与 reload 白名单——只要你按第 2 步 import 了，键就不会漏。
-**唯一要改的测试**是 `tests/test_config_schema.py` 的快照集合（那是刻意的门禁）。
+`Config.__init__` 的默认值 dict 与 `reload()` 的白名单元组都是**手写字面量**
+（`pet/config.py` 是纯逻辑层，不 import `pet/tts`，遍历注册表无从谈起）：把每个
+`spec.key` 分别加进这两处，值抄 `spec.default`，`secret` 字段的键不进
+（凭据只存系统钥匙串）。漏登记的表现是「设置页有行、写回却被白名单门外丢掉 /
+reload 后键消失」——`tests/test_config_schema.py` 的护栏与显式快照会立刻红，
+照它的提示补齐即可（快照也要同步改，那是刻意的门禁）。
 
 ### 4. 补测试
 
@@ -103,9 +106,13 @@ from . import edge, mimo, mytts  # noqa: F401 —— import 即注册
 | `text` | 单行输入 | `placeholder` / `max_length` |
 | `multiline` | 多行文本框（**整行铺开**） | `placeholder` / `max_length` / `min_height`；写整句描述（风格指令、音色描述）用它 |
 | `secret` | 密码框 + 清除按钮 | `secret_ref`（存系统钥匙串，**绝不进 config.json**） |
+| `path` | 路径框 + 浏览按钮 | `file_filter`（文件对话框过滤器，空=所有文件）；`affects_cache=True` 表示文件内容影响输出——服务层会把文件指纹并进缓存键，换文件即换缓存（范例：MiMo 克隆音色的参考音频） |
 
-字段间依赖用 `hidden_when=(另一个字段的 name, 值)` 声明（例：MiMo 选「音色设计」
-模型时隐藏内置音色行），设置页自动处理，不需要写 UI 代码。
+字段间依赖用 `hidden_when=(另一个字段的 name, 值)` 声明（多条写成
+`((name, 值), (name, 值))`，任一命中即隐；例：MiMo 选「音色设计」/「克隆音色」
+模型时隐藏内置音色行）；反过来的白名单语义用 `visible_when=(name, 值)`
+（例：MiMo 选「克隆音色」才出现参考音频行）。两种声明统一由 `tts.field_visible`
+解释，设置页自动处理，不需要写 UI 代码。
 
 ---
 
